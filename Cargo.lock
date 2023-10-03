@@ -243,6 +243,7 @@ dependencies = [
  "aptos-keygen",
  "aptos-ledger",
  "aptos-logger",
+ "aptos-move-graphql-schema",
  "aptos-network-checker",
  "aptos-node",
  "aptos-protos",
