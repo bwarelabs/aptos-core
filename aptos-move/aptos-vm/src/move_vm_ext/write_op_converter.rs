@@ -155,25 +155,16 @@ impl<'r> WriteOpConverter<'r> {
         // fully backwards compatibly, and lets obtain final storage op by replacing bytes.
         let metadata_op = if post_group_size == 0 {
             MoveStorageOp::Delete
+        } else if pre_group_size == 0 {
+            MoveStorageOp::New(Bytes::new())
         } else {
-            let encoded_group_size = bcs::to_bytes(&post_group_size)
-                .map_err(|_| {
-                    VMStatus::error(
-                        StatusCode::STORAGE_ERROR,
-                        err_msg("Group size underflow while applying updates"),
-                    )
-                })?
-                .into();
-            if pre_group_size == 0 {
-                MoveStorageOp::New(encoded_group_size)
-            } else {
-                MoveStorageOp::Modify(encoded_group_size)
-            }
+            MoveStorageOp::Modify(Bytes::new())
         };
-        Ok(GroupWrite {
-            metadata_op: self.convert(state_value_metadata_result, metadata_op, false)?,
+        Ok(GroupWrite::new(
+            self.convert(state_value_metadata_result, metadata_op, false)?,
+            post_group_size,
             inner_ops,
-        })
+        ))
     }
 
     fn convert(
@@ -384,18 +375,21 @@ mod tests {
             .convert_resource_group_v1(&key, group_changes)
             .unwrap();
 
-        assert_eq!(group_write.metadata_op.metadata(), Some(&metadata));
+        assert_eq!(group_write.metadata_op().metadata(), Some(&metadata));
         let expected_new_size = bcs::serialized_size(&mock_tag_1()).unwrap()
             + bcs::serialized_size(&mock_tag_2()).unwrap()
             + 7; // values bytes size: 2 + 5
         assert_eq!(
-            bcs::from_bytes::<u64>(group_write.metadata_op.bytes().unwrap()).unwrap(),
+            bcs::from_bytes::<u64>(group_write.metadata_op().bytes().unwrap()).unwrap(),
             expected_new_size as u64
         );
-        assert_eq!(group_write.inner_ops.len(), 2);
-        assert_some_eq!(group_write.inner_ops.get(&mock_tag_0()), &WriteOp::Deletion);
+        assert_eq!(group_write.inner_ops().len(), 2);
         assert_some_eq!(
-            group_write.inner_ops.get(&mock_tag_2()),
+            group_write.inner_ops().get(&mock_tag_0()),
+            &WriteOp::Deletion
+        );
+        assert_some_eq!(
+            group_write.inner_ops().get(&mock_tag_2()),
             &WriteOp::Modification(vec![5, 5, 5, 5, 5].into())
         );
     }
@@ -424,18 +418,18 @@ mod tests {
             .convert_resource_group_v1(&key, group_changes)
             .unwrap();
 
-        assert_eq!(group_write.metadata_op.metadata(), Some(&metadata));
+        assert_eq!(group_write.metadata_op().metadata(), Some(&metadata));
         let expected_new_size = bcs::serialized_size(&mock_tag_0()).unwrap()
             + bcs::serialized_size(&mock_tag_1()).unwrap()
             + bcs::serialized_size(&mock_tag_2()).unwrap()
             + 6; // values bytes size: 1 + 2 + 3.
         assert_eq!(
-            bcs::from_bytes::<u64>(group_write.metadata_op.bytes().unwrap()).unwrap(),
+            bcs::from_bytes::<u64>(group_write.metadata_op().bytes().unwrap()).unwrap(),
             expected_new_size as u64
         );
-        assert_eq!(group_write.inner_ops.len(), 1);
+        assert_eq!(group_write.inner_ops().len(), 1);
         assert_some_eq!(
-            group_write.inner_ops.get(&mock_tag_2()),
+            group_write.inner_ops().get(&mock_tag_2()),
             &WriteOp::Creation(vec![3, 3, 3].into())
         );
     }
@@ -452,15 +446,15 @@ mod tests {
             .convert_resource_group_v1(&key, group_changes)
             .unwrap();
 
-        assert_none!(group_write.metadata_op.metadata());
+        assert_none!(group_write.metadata_op().metadata());
         let expected_new_size = bcs::serialized_size(&mock_tag_1()).unwrap() + 2;
         assert_eq!(
-            bcs::from_bytes::<u64>(group_write.metadata_op.bytes().unwrap()).unwrap(),
+            bcs::from_bytes::<u64>(group_write.metadata_op().bytes().unwrap()).unwrap(),
             expected_new_size as u64
         );
-        assert_eq!(group_write.inner_ops.len(), 1);
+        assert_eq!(group_write.inner_ops().len(), 1);
         assert_some_eq!(
-            group_write.inner_ops.get(&mock_tag_1()),
+            group_write.inner_ops().get(&mock_tag_1()),
             &WriteOp::Creation(vec![2, 2].into())
         );
     }
@@ -491,10 +485,10 @@ mod tests {
             .unwrap();
 
         // Deletion should still contain the metadata - for storage refunds.
-        assert_eq!(group_write.metadata_op.metadata(), Some(&metadata));
-        assert_eq!(group_write.metadata_op, WriteOp::DeletionWithMetadata {
+        assert_eq!(group_write.metadata_op().metadata(), Some(&metadata));
+        assert_eq!(group_write.metadata_op(), &WriteOp::DeletionWithMetadata {
             metadata
         });
-        assert_none!(group_write.metadata_op.bytes());
+        assert_none!(group_write.metadata_op().bytes());
     }
 }
