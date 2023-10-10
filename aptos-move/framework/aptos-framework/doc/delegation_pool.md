@@ -171,6 +171,8 @@ transferred to A
 -  [Function `calculate_and_update_delegator_voter_internal`](#0x1_delegation_pool_calculate_and_update_delegator_voter_internal)
 -  [Function `calculate_and_update_delegated_votes`](#0x1_delegation_pool_calculate_and_update_delegated_votes)
 -  [Function `set_operator`](#0x1_delegation_pool_set_operator)
+-  [Function `set_beneficiary_for_operator`](#0x1_delegation_pool_set_beneficiary_for_operator)
+-  [Function `set_beneficiary_for_operator_internal`](#0x1_delegation_pool_set_beneficiary_for_operator_internal)
 -  [Function `set_delegated_voter`](#0x1_delegation_pool_set_delegated_voter)
 -  [Function `delegate_voting_power`](#0x1_delegation_pool_delegate_voting_power)
 -  [Function `add_stake`](#0x1_delegation_pool_add_stake)
@@ -915,6 +917,16 @@ The function is disabled or hasn't been enabled.
 
 
 <pre><code><b>const</b> <a href="delegation_pool.md#0x1_delegation_pool_EDISABLED_FUNCTION">EDISABLED_FUNCTION</a>: u64 = 13;
+</code></pre>
+
+
+
+<a name="0x1_delegation_pool_ENOT_OPERATOR"></a>
+
+The account is not the operator of the stake pool.
+
+
+<pre><code><b>const</b> <a href="delegation_pool.md#0x1_delegation_pool_ENOT_OPERATOR">ENOT_OPERATOR</a>: u64 = 18;
 </code></pre>
 
 
@@ -2568,6 +2580,69 @@ Allows an owner to change the operator of the underlying stake pool.
     // ensure the <b>old</b> operator is paid its uncommitted commission rewards
     <a href="delegation_pool.md#0x1_delegation_pool_synchronize_delegation_pool">synchronize_delegation_pool</a>(pool_address);
     <a href="stake.md#0x1_stake_set_operator">stake::set_operator</a>(&<a href="delegation_pool.md#0x1_delegation_pool_retrieve_stake_pool_owner">retrieve_stake_pool_owner</a>(<b>borrow_global</b>&lt;<a href="delegation_pool.md#0x1_delegation_pool_DelegationPool">DelegationPool</a>&gt;(pool_address)), new_operator);
+    // set the beneficiary
+    <a href="delegation_pool.md#0x1_delegation_pool_set_beneficiary_for_operator_internal">set_beneficiary_for_operator_internal</a>(pool_address, new_operator);
+}
+</code></pre>
+
+
+
+</details>
+
+<a name="0x1_delegation_pool_set_beneficiary_for_operator"></a>
+
+## Function `set_beneficiary_for_operator`
+
+Allows an operator to change the beneficiary of the underlying stake pool.
+
+
+<pre><code><b>public</b> entry <b>fun</b> <a href="delegation_pool.md#0x1_delegation_pool_set_beneficiary_for_operator">set_beneficiary_for_operator</a>(operator: &<a href="../../aptos-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a>, owner_address: <b>address</b>, new_beneficiary: <b>address</b>)
+</code></pre>
+
+
+
+<details>
+<summary>Implementation</summary>
+
+
+<pre><code><b>public</b> entry <b>fun</b> <a href="delegation_pool.md#0x1_delegation_pool_set_beneficiary_for_operator">set_beneficiary_for_operator</a>(
+    operator: &<a href="../../aptos-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a>,
+    owner_address: <b>address</b>,
+    new_beneficiary: <b>address</b>,
+) <b>acquires</b> <a href="delegation_pool.md#0x1_delegation_pool_DelegationPoolOwnership">DelegationPoolOwnership</a>, <a href="delegation_pool.md#0x1_delegation_pool_DelegationPool">DelegationPool</a>, <a href="delegation_pool.md#0x1_delegation_pool_GovernanceRecords">GovernanceRecords</a> {
+    <b>let</b> pool_address = <a href="delegation_pool.md#0x1_delegation_pool_get_owned_pool_address">get_owned_pool_address</a>(owner_address);
+    <b>assert</b>(<a href="stake.md#0x1_stake_get_operator">stake::get_operator</a>(pool_address) == <a href="../../aptos-stdlib/../move-stdlib/doc/signer.md#0x1_signer_address_of">signer::address_of</a>(operator), <a href="../../aptos-stdlib/../move-stdlib/doc/error.md#0x1_error_unauthenticated">error::unauthenticated</a>(<a href="delegation_pool.md#0x1_delegation_pool_ENOT_OPERATOR">ENOT_OPERATOR</a>));
+    <a href="delegation_pool.md#0x1_delegation_pool_synchronize_delegation_pool">synchronize_delegation_pool</a>(pool_address);
+    <a href="delegation_pool.md#0x1_delegation_pool_set_beneficiary_for_operator_internal">set_beneficiary_for_operator_internal</a>(pool_address, new_beneficiary);
+}
+</code></pre>
+
+
+
+</details>
+
+<a name="0x1_delegation_pool_set_beneficiary_for_operator_internal"></a>
+
+## Function `set_beneficiary_for_operator_internal`
+
+
+
+<pre><code><b>fun</b> <a href="delegation_pool.md#0x1_delegation_pool_set_beneficiary_for_operator_internal">set_beneficiary_for_operator_internal</a>(pool_address: <b>address</b>, new_beneficiary: <b>address</b>)
+</code></pre>
+
+
+
+<details>
+<summary>Implementation</summary>
+
+
+<pre><code><b>fun</b> <a href="delegation_pool.md#0x1_delegation_pool_set_beneficiary_for_operator_internal">set_beneficiary_for_operator_internal</a>(
+    pool_address: <b>address</b>,
+    new_beneficiary: <b>address</b>,
+) <b>acquires</b> <a href="delegation_pool.md#0x1_delegation_pool_DelegationPool">DelegationPool</a> {
+    <b>let</b> <a href="delegation_pool.md#0x1_delegation_pool">delegation_pool</a> = <b>borrow_global</b>&lt;<a href="delegation_pool.md#0x1_delegation_pool_DelegationPool">DelegationPool</a>&gt;(pool_address);
+    <b>let</b> stake_pool_signer = <a href="delegation_pool.md#0x1_delegation_pool_retrieve_stake_pool_owner">retrieve_stake_pool_owner</a>(<a href="delegation_pool.md#0x1_delegation_pool">delegation_pool</a>);
+    <a href="stake.md#0x1_stake_set_beneficiary_for_operator">stake::set_beneficiary_for_operator</a>(&stake_pool_signer, new_beneficiary);
 }
 </code></pre>
 
@@ -3436,10 +3511,11 @@ shares pools, assign commission to operator and eventually prepare delegation po
     );
 
     // reward operator its commission out of uncommitted active rewards (`add_stake` fees already excluded)
-    <a href="delegation_pool.md#0x1_delegation_pool_buy_in_active_shares">buy_in_active_shares</a>(pool, <a href="stake.md#0x1_stake_get_operator">stake::get_operator</a>(pool_address), commission_active);
+    <a href="delegation_pool.md#0x1_delegation_pool_buy_in_active_shares">buy_in_active_shares</a>(pool, <a href="stake.md#0x1_stake_get_beneficiary_for_operator">stake::get_beneficiary_for_operator</a>(pool_address), commission_active);
     // reward operator its commission out of uncommitted pending_inactive rewards
-    <a href="delegation_pool.md#0x1_delegation_pool_buy_in_pending_inactive_shares">buy_in_pending_inactive_shares</a>(pool, <a href="stake.md#0x1_stake_get_operator">stake::get_operator</a>(pool_address), commission_pending_inactive);
+    <a href="delegation_pool.md#0x1_delegation_pool_buy_in_pending_inactive_shares">buy_in_pending_inactive_shares</a>(pool, <a href="stake.md#0x1_stake_get_beneficiary_for_operator">stake::get_beneficiary_for_operator</a>(pool_address), commission_pending_inactive);
 
+    // TODO: beneficiary?
     <a href="event.md#0x1_event_emit_event">event::emit_event</a>(
         &<b>mut</b> pool.distribute_commission_events,
         <a href="delegation_pool.md#0x1_delegation_pool_DistributeCommissionEvent">DistributeCommissionEvent</a> {

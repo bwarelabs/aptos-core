@@ -905,6 +905,15 @@ module aptos_framework::vesting {
         set_management_role(admin, contract_address, utf8(ROLE_BENEFICIARY_RESETTER), beneficiary_resetter);
     }
 
+    /// Set the beneficiary for the operator.
+    public entry fun set_beneficiary_for_operator(
+        operator: &signer,
+        contract_address: address,
+        new_beneficiary: address,
+    ) {
+        staking_contract::set_beneficiary_for_operator(operator, contract_address, new_beneficiary);
+    }
+
     public fun get_role_holder(contract_address: address, role: String): address acquires VestingAccountManagement {
         assert!(exists<VestingAccountManagement>(contract_address), error::not_found(EVESTING_ACCOUNT_HAS_NO_ROLES));
         let roles = &borrow_global<VestingAccountManagement>(contract_address).roles;
@@ -1532,6 +1541,70 @@ module aptos_framework::vesting {
 
         // Assert that the operator receives the expected commission.
         assert!(coin::balance<AptosCoin>(operator_address) == expected_commission, 1);
+    }
+
+    #[test(aptos_framework = @0x1, admin = @0x123, shareholder = @0x234, operator = @0x345, beneficiary = @0x456)]
+    public entry fun test_set_beneficiary_for_operator(
+        aptos_framework: &signer,
+        admin: &signer,
+        shareholder: &signer,
+        operator: &signer,
+        beneficiary: &signer,
+    ) acquires AdminStore, VestingContract {
+        let admin_address = signer::address_of(admin);
+        let operator_address = signer::address_of(operator);
+        let shareholder_address = signer::address_of(shareholder);
+        let beneficiary_address = signer::address_of(beneficiary);
+        setup(aptos_framework, &vector[admin_address, shareholder_address, operator_address, beneficiary_address]);
+        let contract_address = setup_vesting_contract(
+            admin, &vector[shareholder_address], &vector[GRANT_AMOUNT], admin_address, 0);
+        assert!(operator_commission_percentage(contract_address) == 0, 0);
+        let stake_pool_address = stake_pool_address(contract_address);
+        // 10% commission will be paid to the operator.
+        update_operator(admin, contract_address, operator_address, 10);
+        assert!(stake::get_beneficiary_for_operator(stake_pool_address) == operator_address, 0);
+        set_beneficiary_for_operator(operator, contract_address, beneficiary_address);
+        assert!(stake::get_beneficiary_for_operator(stake_pool_address) == beneficiary_address, 0);
+
+        // Operator needs to join the validator set for the stake pool to earn rewards.
+        let (_sk, pk, pop) = stake::generate_identity();
+        stake::join_validator_set_for_test(&pk, &pop, operator, stake_pool_address, true);
+        stake::assert_stake_pool(stake_pool_address, GRANT_AMOUNT, 0, 0, 0);
+        assert!(get_accumulated_rewards(contract_address) == 0, 0);
+        assert!(remaining_grant(contract_address) == GRANT_AMOUNT, 0);
+
+        // Stake pool earns some rewards.
+        stake::end_epoch();
+        let (_, accumulated_rewards, _) = staking_contract::staking_contract_amounts(contract_address, operator_address);
+
+        // Update commission percentage to 20%. This also immediately requests commission.
+        update_commission_percentage(admin, contract_address, 20);
+        // Assert that the operator is still the same, and the commission percentage is updated to 20%.
+        assert!(operator(contract_address) == operator_address, 0);
+        assert!(operator_commission_percentage(contract_address) == 20, 0);
+
+        // Commission is calculated using the previous commission percentage which is 10%.
+        let expected_commission = accumulated_rewards / 10;
+
+        // Stake pool earns some more rewards.
+        stake::end_epoch();
+        let (_, accumulated_rewards, _) = staking_contract::staking_contract_amounts(contract_address, operator_address);
+
+        // Request commission again.
+        staking_contract::request_commission(operator, contract_address, operator_address);
+        // The commission is calculated using the current commission percentage which is 20%.
+        expected_commission = with_rewards(expected_commission) + (accumulated_rewards / 5);
+
+        // Unlocks the commission.
+        stake::fast_forward_to_unlock(stake_pool_address);
+        expected_commission = with_rewards(expected_commission);
+
+        // Distribute the commission to the operator.
+        distribute(contract_address);
+
+        // Assert that the beneficiary receives the expected commission.
+        assert!(coin::balance<AptosCoin>(operator_address) == 0, 1);
+        assert!(coin::balance<AptosCoin>(beneficiary_address) == expected_commission, 1);
     }
 
     #[test(aptos_framework = @0x1, admin = @0x123, shareholder = @0x234)]

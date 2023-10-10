@@ -197,6 +197,11 @@ module aptos_framework::stake {
         validators: vector<IndividualValidatorPerformance>,
     }
 
+    // The beneficiary address for the operator.
+    struct Beneficiary has key {
+        beneficiary: address
+    }
+
     struct RegisterValidatorCandidateEvent has drop, store {
         pool_address: address,
     }
@@ -368,6 +373,16 @@ module aptos_framework::stake {
         borrow_global<StakePool>(pool_address).operator_address
     }
 
+    #[view]
+    /// Return the operator of the validator at `pool_address`.
+    public fun get_beneficiary_for_operator(pool_address: address): address acquires StakePool, Beneficiary {
+        assert_stake_pool_exists(pool_address);
+        if(exists<Beneficiary>(pool_address)) {
+            borrow_global<Beneficiary>(pool_address).beneficiary
+        } else {
+            borrow_global<StakePool>(pool_address).operator_address
+        }
+    }
     /// Return the pool address in `owner_cap`.
     public fun get_owned_pool_address(owner_cap: &OwnerCapability): address {
         owner_cap.pool_address
@@ -588,6 +603,20 @@ module aptos_framework::stake {
                 new_operator,
             },
         );
+    }
+
+    /// Allows to change the beneficiary for the oeprator of the stake pool.
+    public fun set_beneficiary_for_operator(pool_signer: &signer, new_beneficiary: address) acquires Beneficiary {
+        let pool_address = signer::address_of(pool_signer);
+        assert_stake_pool_exists(pool_address);
+        if (!exists<Beneficiary>(pool_address)) {
+            move_to(pool_signer, Beneficiary { beneficiary: new_beneficiary });
+        }
+        else {
+            let beneficiary = borrow_global_mut<Beneficiary>(pool_address);
+            beneficiary.beneficiary = new_beneficiary;
+        }
+        // TODO: emit an event
     }
 
     /// Allows an owner to change the delegated voter of the stake pool.

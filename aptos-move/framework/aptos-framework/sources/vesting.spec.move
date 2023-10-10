@@ -365,6 +365,15 @@ spec aptos_framework::vesting {
         include SetManagementRoleAbortsIf;
     }
 
+    spec set_beneficiary_for_operator(
+        operator: &signer,
+        contract_address: address,
+        new_beneficiary: address,
+    ) {
+        // TODO: temporary mockup
+        pragma verify = false;
+    }
+
     spec get_role_holder(contract_address: address, role: String): address {
         aborts_if !exists<VestingAccountManagement>(contract_address);
         let roles = global<VestingAccountManagement>(contract_address).roles;

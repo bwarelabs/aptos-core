@@ -34,6 +34,7 @@ module aptos_framework::staking_contract {
     use aptos_std::simple_map::{Self, SimpleMap};
 
     use aptos_framework::account::{Self, SignerCapability};
+    use aptos_framework::aptos_account::{assert_account_is_registered_for_apt};
     use aptos_framework::aptos_coin::AptosCoin;
     use aptos_framework::coin::{Self, Coin};
     use aptos_framework::event::{EventHandle, emit_event};
@@ -56,8 +57,8 @@ module aptos_framework::staking_contract {
     const ESTAKING_CONTRACT_ALREADY_EXISTS: u64 = 6;
     /// Not enough active stake to withdraw. Some stake might still pending and will be active in the next epoch.
     const EINSUFFICIENT_ACTIVE_STAKE_TO_WITHDRAW: u64 = 7;
-    /// Caller must be either the staker or operator.
-    const ENOT_STAKER_OR_OPERATOR: u64 = 8;
+    /// Caller must be either the staker, operator, or beneficiary.
+    const ENOT_STAKER_OR_OPERATOR_OR_BENEFICIARY: u64 = 8;
 
     /// Maximum number of distributions a stake pool can support.
     const MAXIMUM_PENDING_DISTRIBUTIONS: u64 = 20;
@@ -234,6 +235,14 @@ module aptos_framework::staking_contract {
     }
 
     #[view]
+    /// Return the beneficiary address of the operator.
+    public fun beneficiary_for_operator(staker: address, operator: address): address acquires Store {
+        assert_staking_contract_exists(staker, operator);
+        let pool_address = stake_pool_address(staker, operator);
+        stake::get_beneficiary_for_operator(pool_address)
+    }
+
+    #[view]
     /// Return the address of the stake pool to be created with the provided staker, operator and seed.
     public fun get_expected_stake_pool_address(
         staker: address,
@@ -406,10 +415,13 @@ module aptos_framework::staking_contract {
     /// Unlock commission amount from the stake pool. Operator needs to wait for the amount to become withdrawable
     /// at the end of the stake pool's lockup period before they can actually can withdraw_commission.
     ///
-    /// Only staker or operator can call this.
+    /// Only staker, operator or beneficiary can call this.
     public entry fun request_commission(account: &signer, staker: address, operator: address) acquires Store {
         let account_addr = signer::address_of(account);
-        assert!(account_addr == staker || account_addr == operator, error::unauthenticated(ENOT_STAKER_OR_OPERATOR));
+        assert!(
+            account_addr == staker || account_addr == operator || account_addr == beneficiary_for_operator(staker, operator),
+            error::unauthenticated(ENOT_STAKER_OR_OPERATOR_OR_BENEFICIARY)
+        );
         assert_staking_contract_exists(staker, operator);
 
         let store = borrow_global_mut<Store>(staker);
@@ -574,6 +586,24 @@ module aptos_framework::staking_contract {
             &mut store.switch_operator_events,
             SwitchOperatorEvent { pool_address, old_operator, new_operator }
         );
+
+        // Set the beneficiary address to the new operator by default.
+        set_beneficiary_for_operator_internal(new_operator, staker_address, new_operator);
+    }
+
+    public entry fun set_beneficiary_for_operator(operator: &signer, staker: address, new_beneficiary: address) acquires Store {
+        let operator_addr = signer::address_of(operator);
+        assert_staking_contract_exists(staker, operator_addr);
+        assert_account_is_registered_for_apt(new_beneficiary);
+        set_beneficiary_for_operator_internal(operator_addr, staker, new_beneficiary);
+    }
+
+    fun set_beneficiary_for_operator_internal(operator: address, staker: address, new_beneficiary: address) acquires Store {
+        assert_staking_contract_exists(staker, operator);
+        let staking_contracts = &borrow_global<Store>(staker).staking_contracts;
+        let pool_signer_cap = &simple_map::borrow(staking_contracts, &operator).signer_cap;
+        let pool_signer = account::create_signer_with_capability(pool_signer_cap);
+        stake::set_beneficiary_for_operator(&pool_signer, new_beneficiary);
     }
 
     /// Allow anyone to distribute already unlocked funds. This does not affect reward compounding and therefore does
@@ -612,6 +642,10 @@ module aptos_framework::staking_contract {
             let recipient = *vector::borrow(&mut recipients, 0);
             let current_shares = pool_u64::shares(distribution_pool, recipient);
             let amount_to_distribute = pool_u64::redeem_shares(distribution_pool, recipient, current_shares);
+            // If the recipient is the operator, send the commission to the beneficiary instead.
+            if (recipient == operator) {
+                recipient = stake::get_beneficiary_for_operator(staking_contract.pool_address);
+            };
             coin::deposit(recipient, coin::extract(&mut coins, amount_to_distribute));
 
             emit_event(
@@ -1125,6 +1159,67 @@ module aptos_framework::staking_contract {
         assert!(staking_contract_exists(staker_address, operator_2_address), 0);
         assert!(!staking_contract_exists(staker_address, operator_1_address), 1);
         assert!(commission_percentage(staker_address, operator_2_address) == 10, 2);
+    }
+
+    #[test(aptos_framework = @0x1, staker = @0x123, operator = @0x234, beneficiary = @0x345)]
+    public entry fun test_operator_can_set_beneficiary(
+        aptos_framework: &signer,
+        staker: &signer,
+        operator: &signer,
+        beneficiary: &signer,
+    ) acquires Store {
+        setup_staking_contract(aptos_framework, staker, operator, INITIAL_BALANCE, 10);
+        let staker_address = signer::address_of(staker);
+        let operator_address = signer::address_of(operator);
+        let beneficiary_address = signer::address_of(beneficiary);
+        // account::create_account_for_test(beneficiary_address);
+        aptos_framework::aptos_account::create_account(beneficiary_address);
+        assert_staking_contract_exists(staker_address, operator_address);
+        assert_staking_contract(staker_address, operator_address, INITIAL_BALANCE, 10);
+
+        // Verify that the stake pool has been set up properly.
+        let pool_address = stake_pool_address(staker_address, operator_address);
+        stake::assert_stake_pool(pool_address, INITIAL_BALANCE, 0, 0, 0);
+        assert!(last_recorded_principal(staker_address, operator_address) == INITIAL_BALANCE, 0);
+        assert!(stake::get_operator(pool_address) == operator_address, 0);
+        assert!(stake::get_beneficiary_for_operator(pool_address) == operator_address, 0);
+
+        // Operator joins the validator set.
+        let (_sk, pk, pop) = stake::generate_identity();
+        stake::join_validator_set_for_test(&pk, &pop, operator, pool_address, true);
+        assert!(stake::get_validator_state(pool_address) == VALIDATOR_STATUS_ACTIVE, 1);
+
+        // Set beneficiary.
+        set_beneficiary_for_operator(operator, staker_address, beneficiary_address);
+        assert!(stake::get_beneficiary_for_operator(pool_address) == beneficiary_address, 0);
+
+        // Fast forward to generate rewards.
+        stake::end_epoch();
+        let new_balance = with_rewards(INITIAL_BALANCE);
+        stake::assert_stake_pool(pool_address, new_balance, 0, 0, 0);
+
+        // Operator claims 10% of rewards so far as commissions.
+        let expected_commission_1 = (new_balance - last_recorded_principal(staker_address, operator_address)) / 10;
+        new_balance = new_balance - expected_commission_1;
+        request_commission(operator, staker_address, operator_address);
+        stake::assert_stake_pool(pool_address, new_balance, 0, 0, expected_commission_1);
+        assert!(last_recorded_principal(staker_address, operator_address) == new_balance, 0);
+        assert_distribution(staker_address, operator_address, operator_address, expected_commission_1);
+        stake::fast_forward_to_unlock(pool_address);
+
+        // Both original stake and operator commissions have received rewards.
+        expected_commission_1 = with_rewards(expected_commission_1);
+        new_balance = with_rewards(new_balance);
+        stake::assert_stake_pool(pool_address, new_balance, expected_commission_1, 0, 0);
+        distribute(staker_address, operator_address);
+        let operator_balance = coin::balance<AptosCoin>(operator_address);
+        let beneficiary_balance = coin::balance<AptosCoin>(beneficiary_address);
+        let expected_operator_balance = INITIAL_BALANCE;
+        let expected_beneficiary_balance = expected_commission_1;
+        assert!(operator_balance == expected_operator_balance, operator_balance);
+        assert!(beneficiary_balance == expected_beneficiary_balance, beneficiary_balance);
+        stake::assert_stake_pool(pool_address, new_balance, 0, 0, 0);
+        assert_no_pending_distributions(staker_address, operator_address);
     }
 
     #[test(aptos_framework = @0x1, staker = @0x123, operator = @0x234)]
