@@ -6,13 +6,17 @@ use crate::{
     counters,
     scheduler::{DependencyResult, DependencyStatus, Scheduler},
 };
+use anyhow::bail;
 use aptos_aggregator::{
     delta_change_set::serialize,
     resolver::{AggregatorReadMode, TAggregatorView},
 };
 use aptos_logger::error;
 use aptos_mvhashmap::{
-    types::{MVDataError, MVDataOutput, MVModulesError, MVModulesOutput, TxnIndex},
+    types::{
+        GroupReadResult, MVDataError, MVDataOutput, MVGroupError, MVModulesError, MVModulesOutput,
+        StorageVersion, TxnIndex,
+    },
     unsync_map::UnsyncMap,
     MVHashMap,
 };
@@ -29,11 +33,17 @@ use aptos_types::{
 use aptos_vm_logging::{log_schema::AdapterLogSchema, prelude::*};
 use aptos_vm_types::resolver::{StateStorageView, TModuleView, TResourceGroupView, TResourceView};
 use bytes::Bytes;
+use claims::assert_ok;
 use move_core_types::{
     value::MoveTypeLayout,
     vm_status::{StatusCode, VMStatus},
 };
-use std::{cell::RefCell, fmt::Debug, sync::atomic::AtomicU32};
+use std::{
+    cell::RefCell,
+    collections::{BTreeMap, HashMap},
+    fmt::Debug,
+    sync::{atomic::AtomicU32, Arc},
+};
 
 /// A struct which describes the result of the read from the proxy. The client
 /// can interpret these types to further resolve the reads.
@@ -133,6 +143,118 @@ impl<'a, T: Transaction, X: Executable> ParallelState<'a, T, X> {
         }
     }
 
+    fn read_from_group(
+        &self,
+        group_key: &T::Key,
+        resource_tag: &T::Tag,
+        txn_idx: TxnIndex,
+    ) -> anyhow::Result<GroupReadResult> {
+        use MVGroupError::*;
+
+        if let Some(DataRead::Versioned(_, v)) =
+            self.captured_reads
+                .borrow()
+                .get_by_kind(group_key, Some(resource_tag), ReadKind::Value)
+        {
+            return Ok(GroupReadResult::Value(v.extract_raw_bytes()));
+        }
+
+        loop {
+            match self
+                .versioned_map
+                .group_data()
+                .read_from_group(group_key, resource_tag, txn_idx)
+            {
+                Ok((version, v)) => {
+                    let data_read = DataRead::Versioned(version, v.clone());
+
+                    assert_ok!(
+                        self.captured_reads.borrow_mut().capture_read(
+                            group_key.clone(),
+                            Some(resource_tag.clone()),
+                            data_read
+                        ),
+                        "Resource read in group recorded once: may not be inconsistent"
+                    );
+
+                    return Ok(GroupReadResult::Value(v.extract_raw_bytes()));
+                },
+                Err(Uninitialized) => {
+                    return Ok(GroupReadResult::Uninitialized);
+                },
+                Err(TagNotFound) => {
+                    let data_read = DataRead::Versioned(
+                        Err(StorageVersion),
+                        Arc::<T::Value>::new(TransactionWrite::from_state_value(None)),
+                    );
+                    assert_ok!(
+                        self.captured_reads.borrow_mut().capture_read(
+                            group_key.clone(),
+                            Some(resource_tag.clone()),
+                            data_read
+                        ),
+                        "Resource read in group recorded once: may not be inconsistent"
+                    );
+
+                    return Ok(GroupReadResult::Value(None));
+                },
+                Err(Dependency(dep_idx)) => {
+                    if !self.wait_for_dependency(txn_idx, dep_idx) {
+                        bail!("Interrupted as block execution was halted");
+                    }
+                },
+                Err(TagSerializationError) => {
+                    unreachable!("Reading a resource does not require tag serialization");
+                },
+            }
+        }
+    }
+
+    fn read_group_size(
+        &self,
+        group_key: &T::Key,
+        txn_idx: TxnIndex,
+    ) -> anyhow::Result<GroupReadResult> {
+        use MVGroupError::*;
+
+        if let Some(group_size) = self.captured_reads.borrow().group_size(group_key) {
+            return Ok(GroupReadResult::Size(group_size));
+        }
+
+        loop {
+            match self
+                .versioned_map
+                .group_data()
+                .get_group_size(group_key, txn_idx)
+            {
+                Ok(group_size) => {
+                    assert_ok!(
+                        self.captured_reads
+                            .borrow_mut()
+                            .capture_group_size(group_key.clone(), group_size),
+                        "Group size may not be inconsistent: must be recorded once"
+                    );
+
+                    return Ok(GroupReadResult::Size(group_size));
+                },
+                Err(Uninitialized) => {
+                    return Ok(GroupReadResult::Uninitialized);
+                },
+                Err(TagNotFound) => {
+                    unreachable!("Reading group size does not require a specific tag look-up");
+                },
+                Err(Dependency(dep_idx)) => {
+                    if !self.wait_for_dependency(txn_idx, dep_idx) {
+                        bail!("Interrupted as block execution was halted");
+                    }
+                },
+                Err(TagSerializationError) => {
+                    bail!("Resource tag bcs serialization error");
+                },
+            }
+        }
+    }
+
     /// Captures a read from the VM execution, but not unresolved deltas, as in this case it is the
     /// callers responsibility to set the aggregator's base value and call fetch_data again.
     fn read_data_by_kind(
@@ -219,7 +341,7 @@ impl<'a, T: Transaction, X: Executable> ParallelState<'a, T, X> {
 }
 
 pub(crate) struct SequentialState<'a, T: Transaction, X: Executable> {
-    pub(crate) unsync_map: &'a UnsyncMap<T::Key, T::Value, X>,
+    pub(crate) unsync_map: &'a UnsyncMap<T::Key, T::Tag, T::Value, X>,
     pub(crate) _counter: &'a u32,
 }
 
@@ -335,6 +457,31 @@ impl<'a, T: Transaction, S: TStateView<Key = T::Key>, X: Executable> LatestView<
             },
         }
     }
+
+    fn initialize_group(&self, group_key: &T::Key) -> anyhow::Result<()> {
+        let base_group: BTreeMap<T::Tag, Bytes> = match self.get_base_value(group_key)? {
+            Some(state_value) => bcs::from_bytes(state_value.bytes())
+                .map_err(|_| anyhow::Error::msg("Resource group deserialization error"))?,
+            None => BTreeMap::new(),
+        };
+        let base_group_sentinel_ops = base_group.into_iter().map(|(t, bytes)| {
+            (
+                t,
+                TransactionWrite::from_state_value(Some(StateValue::new_legacy(bytes))),
+            )
+        });
+
+        match &self.latest_view {
+            ViewState::Sync(state) => state
+                .versioned_map
+                .group_data()
+                .provide_base_values(group_key.clone(), base_group_sentinel_ops),
+            ViewState::Unsync(state) => state
+                .unsync_map
+                .provide_group_base_values(group_key.clone(), base_group_sentinel_ops),
+        };
+        Ok(())
+    }
 }
 
 impl<'a, T: Transaction, S: TStateView<Key = T::Key>, X: Executable> TResourceView
@@ -391,17 +538,53 @@ impl<'a, T: Transaction, S: TStateView<Key = T::Key>, X: Executable> TResourceGr
     type Layout = MoveTypeLayout;
     type ResourceTag = T::Tag;
 
-    fn resource_group_size(&self, _group_key: &Self::GroupKey) -> anyhow::Result<u64> {
-        unimplemented!("TResourceGroupView not yet implemented");
+    fn resource_group_size(&self, group_key: &Self::GroupKey) -> anyhow::Result<u64> {
+        let mut group_read = match &self.latest_view {
+            ViewState::Sync(state) => state.read_group_size(group_key, self.txn_idx)?,
+            ViewState::Unsync(state) => state.unsync_map.get_group_size(group_key)?,
+        };
+
+        if matches!(group_read, GroupReadResult::Uninitialized) {
+            self.initialize_group(group_key)?;
+
+            group_read = match &self.latest_view {
+                ViewState::Sync(state) => state.read_group_size(group_key, self.txn_idx)?,
+                ViewState::Unsync(state) => state.unsync_map.get_group_size(group_key)?,
+            }
+        };
+
+        Ok(group_read.into_size())
     }
 
     fn get_resource_from_group(
         &self,
-        _group_key: &Self::GroupKey,
-        _resource_tag: &Self::ResourceTag,
+        group_key: &Self::GroupKey,
+        resource_tag: &Self::ResourceTag,
         _maybe_layout: Option<&Self::Layout>,
     ) -> anyhow::Result<Option<Bytes>> {
-        unimplemented!("TResourceGroupView not yet implemented");
+        let mut group_read = match &self.latest_view {
+            ViewState::Sync(state) => {
+                state.read_from_group(group_key, resource_tag, self.txn_idx)?
+            },
+            ViewState::Unsync(state) => state
+                .unsync_map
+                .get_value_from_group(group_key, resource_tag),
+        };
+
+        if matches!(group_read, GroupReadResult::Uninitialized) {
+            self.initialize_group(group_key)?;
+
+            group_read = match &self.latest_view {
+                ViewState::Sync(state) => {
+                    state.read_from_group(group_key, resource_tag, self.txn_idx)?
+                },
+                ViewState::Unsync(state) => state
+                    .unsync_map
+                    .get_value_from_group(group_key, resource_tag),
+            };
+        };
+
+        Ok(group_read.into_value())
     }
 
     fn resource_size_in_group(
@@ -409,7 +592,7 @@ impl<'a, T: Transaction, S: TStateView<Key = T::Key>, X: Executable> TResourceGr
         _group_key: &Self::GroupKey,
         _resource_tag: &Self::ResourceTag,
     ) -> anyhow::Result<u64> {
-        unimplemented!("TResourceGroupView not yet implemented");
+        unimplemented!("Currently resolved by ResourceGroupAdapter");
     }
 
     fn resource_exists_in_group(
@@ -417,7 +600,13 @@ impl<'a, T: Transaction, S: TStateView<Key = T::Key>, X: Executable> TResourceGr
         _group_key: &Self::GroupKey,
         _resource_tag: &Self::ResourceTag,
     ) -> anyhow::Result<bool> {
-        unimplemented!("TResourceGroupView not yet implemented");
+        unimplemented!("Currently resolved by ResourceGroupAdapter");
+    }
+
+    fn release_group_cache(
+        &self,
+    ) -> Option<HashMap<Self::GroupKey, BTreeMap<Self::ResourceTag, Bytes>>> {
+        unimplemented!("Currently resolved by ResourceGroupAdapter");
     }
 }
 

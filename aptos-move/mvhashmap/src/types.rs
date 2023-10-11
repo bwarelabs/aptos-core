@@ -4,6 +4,7 @@
 use aptos_aggregator::delta_change_set::DeltaOp;
 use aptos_crypto::hash::HashValue;
 use aptos_types::executable::ExecutableDescriptor;
+use bytes::Bytes;
 use std::sync::Arc;
 
 pub type TxnIndex = u32;
@@ -55,6 +56,29 @@ pub enum MVModulesError {
     NotFound,
     /// A dependency on other transaction has been found during the read.
     Dependency(TxnIndex),
+}
+
+#[derive(Debug)]
+pub enum GroupReadResult {
+    Value(Option<Bytes>),
+    Size(u64),
+    Uninitialized,
+}
+
+impl GroupReadResult {
+    pub fn into_value(self) -> Option<Bytes> {
+        match self {
+            GroupReadResult::Value(maybe_bytes) => maybe_bytes,
+            _ => unreachable!("Expected bytes"),
+        }
+    }
+
+    pub fn into_size(self) -> u64 {
+        match self {
+            GroupReadResult::Size(size) => size,
+            _ => unreachable!("Expected size"),
+        }
+    }
 }
 
 /// Returned as Ok(..) when read successfully from the multi-version data-structure.

@@ -1,46 +1,122 @@
 // Copyright © Aptos Foundation
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{types::MVModulesOutput, utils::module_hash};
+use crate::{
+    types::{GroupReadResult, MVModulesOutput},
+    utils::module_hash,
+};
 use aptos_crypto::hash::HashValue;
 use aptos_types::{
     executable::{Executable, ExecutableDescriptor, ModulePath},
     write_set::TransactionWrite,
 };
-use std::{cell::RefCell, collections::HashMap, hash::Hash, sync::Arc};
+use aptos_vm_types::resource_group_adapter::group_size_as_sum;
+use serde::Serialize;
+use std::{cell::RefCell, collections::HashMap, fmt::Debug, hash::Hash, sync::Arc};
 
 /// UnsyncMap is designed to mimic the functionality of MVHashMap for sequential execution.
 /// In this case only the latest recorded version is relevant, simplifying the implementation.
 /// The functionality also includes Executable caching based on the hash of ExecutableDescriptor
 /// (i.e. module hash for modules published during the latest block - not at storage version).
-pub struct UnsyncMap<K: ModulePath, V: TransactionWrite, X: Executable> {
+pub struct UnsyncMap<
+    K: ModulePath,
+    T: Hash + Clone + Debug + Eq + Serialize,
+    V: TransactionWrite,
+    X: Executable,
+> {
     // Only use Arc to provide unified interfaces with the MVHashMap / concurrent setting. This
     // simplifies the trait-based integration for executable caching. TODO: better representation.
     // Optional hash can store the hash of the module to avoid re-computations.
     map: RefCell<HashMap<K, (Arc<V>, Option<HashValue>)>>,
+    group_cache: RefCell<HashMap<K, HashMap<T, Arc<V>>>>,
     executable_cache: RefCell<HashMap<HashValue, Arc<X>>>,
     executable_bytes: RefCell<usize>,
 }
 
-impl<K: ModulePath + Hash + Clone + Eq, V: TransactionWrite, X: Executable> Default
-    for UnsyncMap<K, V, X>
+impl<
+        K: ModulePath + Hash + Clone + Eq,
+        T: Hash + Clone + Debug + Eq + Serialize,
+        V: TransactionWrite,
+        X: Executable,
+    > Default for UnsyncMap<K, T, V, X>
 {
     fn default() -> Self {
         Self {
             map: RefCell::new(HashMap::new()),
+            group_cache: RefCell::new(HashMap::new()),
             executable_cache: RefCell::new(HashMap::new()),
             executable_bytes: RefCell::new(0),
         }
     }
 }
 
-impl<K: ModulePath + Hash + Clone + Eq, V: TransactionWrite, X: Executable> UnsyncMap<K, V, X> {
+impl<
+        K: ModulePath + Hash + Clone + Eq,
+        T: Hash + Clone + Debug + Eq + Serialize,
+        V: TransactionWrite,
+        X: Executable,
+    > UnsyncMap<K, T, V, X>
+{
     pub fn new() -> Self {
-        Self {
-            map: RefCell::new(HashMap::new()),
-            executable_cache: RefCell::new(HashMap::new()),
-            executable_bytes: RefCell::new(0),
-        }
+        Self::default()
+    }
+
+    pub fn provide_group_base_values(
+        &self,
+        group_key: K,
+        base_values: impl IntoIterator<Item = (T, V)>,
+    ) {
+        self.group_cache.borrow_mut().insert(
+            group_key,
+            base_values
+                .into_iter()
+                .map(|(t, v)| (t, Arc::new(v)))
+                .collect(),
+        );
+    }
+
+    pub fn get_group_size(&self, group_key: &K) -> anyhow::Result<GroupReadResult> {
+        Ok(match self.group_cache.borrow().get(group_key) {
+            Some(group_map) => GroupReadResult::Size(group_size_as_sum(
+                group_map
+                    .iter()
+                    .flat_map(|(t, v)| v.bytes().map(|bytes| (t, bytes))),
+            )?),
+            None => GroupReadResult::Uninitialized,
+        })
+    }
+
+    pub fn get_value_from_group(&self, group_key: &K, value_tag: &T) -> GroupReadResult {
+        self.group_cache.borrow().get(group_key).map_or(
+            GroupReadResult::Uninitialized,
+            |group_map| {
+                GroupReadResult::Value(
+                    group_map
+                        .get(value_tag)
+                        .map(|v| v.extract_raw_bytes())
+                        .flatten(),
+                )
+            },
+        )
+    }
+
+    /// Contains the latest group ops (excluding deletions) for the given group key.
+    pub fn group_to_commit(&self, group_key: &K) -> Vec<(T, Arc<V>)> {
+        self.group_cache
+            .borrow()
+            .get(group_key)
+            .expect("Resource group must be cached")
+            .iter()
+            .filter_map(|(t, arc_v)| arc_v.bytes().map(|_| (t.clone(), arc_v.clone())))
+            .collect()
+    }
+
+    pub fn insert_group_op(&self, group_key: &K, value_tag: T, v: V) {
+        self.group_cache
+            .borrow_mut()
+            .get_mut(group_key)
+            .expect("Resource group must be cached")
+            .insert(value_tag, Arc::new(v));
     }
 
     pub fn fetch_data(&self, key: &K) -> Option<Arc<V>> {

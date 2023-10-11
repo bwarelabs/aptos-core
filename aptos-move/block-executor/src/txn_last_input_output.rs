@@ -33,6 +33,12 @@ pub(crate) struct TxnOutput<O: TransactionOutput, E: Debug> {
     output_status: ExecutionStatus<O, Error<E>>,
 }
 
+pub(crate) enum KeyKind {
+    Resource,
+    Module,
+    Group,
+}
+
 impl<O: TransactionOutput, E: Debug> TxnOutput<O, E> {
     pub fn from_output_status(output_status: ExecutionStatus<O, Error<E>>) -> Self {
         Self { output_status }
@@ -201,7 +207,7 @@ impl<T: Transaction, O: TransactionOutput<Txn = T>, E: Debug + Send + Clone>
     pub(crate) fn modified_keys(
         &self,
         txn_idx: TxnIndex,
-    ) -> Option<impl Iterator<Item = (T::Key, bool)>> {
+    ) -> Option<impl Iterator<Item = (T::Key, KeyKind)>> {
         self.outputs[txn_idx as usize]
             .load_full()
             .and_then(|txn_output| match &txn_output.output_status {
@@ -210,8 +216,17 @@ impl<T: Transaction, O: TransactionOutput<Txn = T>, E: Debug + Send + Clone>
                         .into_keys()
                         .chain(t.aggregator_v1_write_set().into_keys())
                         .chain(t.aggregator_v1_delta_set().into_keys())
-                        .map(|k| (k, false))
-                        .chain(t.module_write_set().into_keys().map(|k| (k, true))),
+                        .map(|k| (k, KeyKind::Resource))
+                        .chain(
+                            t.module_write_set()
+                                .into_keys()
+                                .map(|k| (k, KeyKind::Module)),
+                        )
+                        .chain(
+                            t.resource_group_write_metadata()
+                                .into_iter()
+                                .map(|(k, _)| (k, KeyKind::Group)),
+                        ),
                 ),
                 ExecutionStatus::Abort(_) => None,
             })
@@ -223,6 +238,18 @@ impl<T: Transaction, O: TransactionOutput<Txn = T>, E: Debug + Send + Clone>
             |txn_output| match &txn_output.output_status {
                 ExecutionStatus::Success(t) | ExecutionStatus::SkipRest(t) => {
                     t.aggregator_v1_delta_set().into_keys().collect()
+                },
+                ExecutionStatus::Abort(_) => vec![],
+            },
+        )
+    }
+
+    pub(crate) fn group_metadata_ops(&self, txn_idx: TxnIndex) -> Vec<(T::Key, T::Value)> {
+        self.outputs[txn_idx as usize].load().as_ref().map_or(
+            vec![],
+            |txn_output| match &txn_output.output_status {
+                ExecutionStatus::Success(t) | ExecutionStatus::SkipRest(t) => {
+                    t.resource_group_write_metadata()
                 },
                 ExecutionStatus::Abort(_) => vec![],
             },
@@ -242,9 +269,27 @@ impl<T: Transaction, O: TransactionOutput<Txn = T>, E: Debug + Send + Clone>
         )
     }
 
+    pub(crate) fn record_finalized_groups(
+        &self,
+        txn_idx: TxnIndex,
+        finalized_groups: Vec<(T::Key, T::Value, Vec<(T::Tag, Arc<T::Value>)>)>,
+    ) {
+        match &self.outputs[txn_idx as usize]
+            .load_full()
+            .expect("Output must exist")
+            .output_status
+        {
+            ExecutionStatus::Success(t) | ExecutionStatus::SkipRest(t) => {
+                t.record_groups(finalized_groups);
+            },
+            ExecutionStatus::Abort(_) => {},
+        };
+    }
+
     // Called when a transaction is committed to record WriteOps for materialized aggregator values
-    // corresponding to the (deltas) in the recorded final output of the transaction.
-    pub(crate) fn record_delta_writes(
+    // corresponding to the (deltas) in the recorded final output of the transaction, as well as
+    // finalized (resource) group updates (which must be stored internally).
+    pub(crate) fn record_additional_writes(
         &self,
         txn_idx: TxnIndex,
         delta_writes: Vec<(T::Key, WriteOp)>,
@@ -255,7 +300,10 @@ impl<T: Transaction, O: TransactionOutput<Txn = T>, E: Debug + Send + Clone>
             .output_status
         {
             ExecutionStatus::Success(t) | ExecutionStatus::SkipRest(t) => {
-                t.incorporate_delta_writes(delta_writes);
+                // Serializes previously recorded finalized group updates. Handles errors internally
+                // (e.g. if the group was not recorded or could not be serialized), in which case
+                // the error will be alerted and the transaction will not be committed.
+                t.incorporate_additional_writes(delta_writes);
             },
             ExecutionStatus::Abort(_) => {},
         };

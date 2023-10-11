@@ -44,13 +44,13 @@ fn test_ok_output_equality_no_deltas() {
     // Different ways to materialize deltas:
     //   1. `try_materialize` preserves the type and returns a result.
     //   2. `try_into_transaction_output` changes the type and returns a result.
-    //   3. `into_transaction_output_with_materialized_deltas` changes the type and
-    //       simply merges materialized deltas.
+    //   3. `into_transaction_output_with_additional_writes` changes the type and
+    //       simply merges writes for materialized deltas & combined groups.
     let materialized_vm_output = assert_ok!(vm_output.clone().try_materialize(&state_view));
     let txn_output_1 = assert_ok!(vm_output.clone().try_into_transaction_output(&state_view));
     let txn_output_2 = vm_output
         .clone()
-        .into_transaction_output_with_materialized_deltas(vec![]);
+        .into_transaction_output_with_additional_writes(vec![], vec![]);
 
     // Because there are no deltas, we should not see any difference in write sets and
     // also all calls must succeed.
@@ -77,7 +77,7 @@ fn test_ok_output_equality_with_deltas() {
     let txn_output_1 = assert_ok!(vm_output.clone().try_into_transaction_output(&state_view));
     let txn_output_2 = vm_output
         .clone()
-        .into_transaction_output_with_materialized_deltas(vec![mock_modify("3", 400)]);
+        .into_transaction_output_with_additional_writes(vec![mock_modify("3", 400)], vec![]);
 
     let expected_aggregator_write_set = HashMap::from([mock_modify("2", 2), mock_modify("3", 400)]);
     assert_eq!(
@@ -113,9 +113,13 @@ fn test_err_output_equality_with_deltas() {
     let mut state_view = FakeDataStore::default();
     state_view.set_legacy(as_state_key!(delta_key), serialize(&900));
 
-    let vm_output = build_vm_output(vec![], vec![], vec![], vec![], vec![mock_add(
-        delta_key, 300,
-    )]);
+    let vm_output = build_vm_output(
+        vec![],
+        vec![],
+        vec![],
+        vec![],
+        vec![mock_add(delta_key, 300)],
+    );
 
     let vm_status_1 = assert_err!(vm_output.clone().try_materialize(&state_view));
     let vm_status_2 = assert_err!(vm_output.try_into_transaction_output(&state_view));

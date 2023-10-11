@@ -80,13 +80,16 @@ impl<'r> WriteOpConverter<'r> {
         // on the group size, this should simply re-read a cached (speculative) group size.
         let pre_group_size = self.remote.resource_group_size(state_key).map_err(|_| {
             VMStatus::error(
-                StatusCode::STORAGE_ERROR,
+                StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR,
                 err_msg("Error querying resource group size"),
             )
         })?;
 
         let mut inner_ops = HashMap::new();
 
+        // STORAGE_ERROR is a placeholder. TODO: change to SPECULATIVE_EXECUTION_ABORT_ERROR, as
+        // the error can happen due to speculative reads (in a non-speculative context, e.g.
+        // during commit, it is a more serious error and block execution must abort).
         let group_size_arithmetics_error = || {
             VMStatus::error(
                 StatusCode::STORAGE_ERROR,
@@ -95,7 +98,7 @@ impl<'r> WriteOpConverter<'r> {
         };
         let tag_serialization_error = |_| {
             VMStatus::error(
-                StatusCode::STORAGE_ERROR,
+                StatusCode::VALUE_SERIALIZATION_ERROR,
                 err_msg("Tag serialization error"),
             )
         };
@@ -118,7 +121,7 @@ impl<'r> WriteOpConverter<'r> {
                             .resource_size_in_group(state_key, &tag)
                             .map_err(|_| {
                                 VMStatus::error(
-                                    StatusCode::STORAGE_ERROR,
+                                    StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR,
                                     err_msg("Error querying resource group size"),
                                 )
                             })?
@@ -486,9 +489,10 @@ mod tests {
 
         // Deletion should still contain the metadata - for storage refunds.
         assert_eq!(group_write.metadata_op().metadata(), Some(&metadata));
-        assert_eq!(group_write.metadata_op(), &WriteOp::DeletionWithMetadata {
-            metadata
-        });
+        assert_eq!(
+            group_write.metadata_op(),
+            &WriteOp::DeletionWithMetadata { metadata }
+        );
         assert_none!(group_write.metadata_op().bytes());
     }
 }

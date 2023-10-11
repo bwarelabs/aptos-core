@@ -110,9 +110,10 @@ impl VMOutput {
 
     /// Similar to `try_into_transaction_output` but deltas are materialized
     /// externally by the caller beforehand.
-    pub fn into_transaction_output_with_materialized_deltas(
+    pub fn into_transaction_output_with_additional_writes(
         mut self,
         materialized_deltas: Vec<(StateKey, WriteOp)>,
+        combined_groups: Vec<(StateKey, WriteOp)>,
     ) -> TransactionOutput {
         assert_eq!(
             materialized_deltas.len(),
@@ -127,6 +128,8 @@ impl VMOutput {
         );
         self.change_set
             .extend_aggregator_write_set(materialized_deltas.into_iter());
+        self.change_set
+            .extend_resource_write_set(combined_groups.into_iter());
 
         let (vm_change_set, gas_used, status) = self.unpack();
         let (write_set, events) = vm_change_set

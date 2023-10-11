@@ -13,11 +13,11 @@ use crate::{
     scheduler::{DependencyStatus, ExecutionTaskType, Scheduler, SchedulerTask, Wave},
     task::{ExecutionStatus, ExecutorTask, TransactionOutput},
     txn_commit_hook::TransactionCommitHook,
-    txn_last_input_output::TxnLastInputOutput,
+    txn_last_input_output::{KeyKind, TxnLastInputOutput},
     view::{LatestView, ParallelState, SequentialState, ViewState},
 };
 use aptos_aggregator::delta_change_set::serialize;
-use aptos_logger::{debug, info};
+use aptos_logger::{debug, error, info};
 use aptos_mvhashmap::{
     types::{Incarnation, TxnIndex},
     unsync_map::UnsyncMap,
@@ -110,6 +110,7 @@ where
                 .resource_write_set()
                 .into_iter()
                 .chain(output.aggregator_v1_write_set().into_iter())
+                .chain(output.resource_group_write_metadata().into_iter())
             {
                 if prev_modified_keys.remove(&k).is_none() {
                     updates_outside = true;
@@ -132,6 +133,15 @@ where
                     updates_outside = true;
                 }
                 versioned_cache.data().add_delta(k, idx_to_execute, d);
+            }
+
+            for (group_key, group_ops) in output.resource_group_inner_ops().into_iter() {
+                versioned_cache.group_data().write(
+                    group_key,
+                    idx_to_execute,
+                    incarnation,
+                    group_ops.into_iter(),
+                );
             }
         };
 
@@ -157,12 +167,16 @@ where
         };
 
         // Remove entries from previous write/delta set that were not overwritten.
-        for (k, is_module) in prev_modified_keys {
-            if is_module {
-                versioned_cache.modules().delete(&k, idx_to_execute);
-            } else {
-                versioned_cache.data().delete(&k, idx_to_execute);
-            }
+        for (k, kind) in prev_modified_keys {
+            use KeyKind::*;
+            match kind {
+                Resource => versioned_cache.data().delete(&k, idx_to_execute),
+                Module => versioned_cache.modules().delete(&k, idx_to_execute),
+                Group => {
+                    versioned_cache.data().delete(&k, idx_to_execute);
+                    versioned_cache.group_data().delete(&k, idx_to_execute);
+                },
+            };
         }
 
         if !last_input_output.record(idx_to_execute, sync_view.take_reads(), result) {
@@ -202,12 +216,18 @@ where
 
             // Not valid and successfully aborted, mark the latest write/delta sets as estimates.
             if let Some(keys) = last_input_output.modified_keys(idx_to_validate) {
-                for (k, is_module_path) in keys {
-                    if is_module_path {
-                        versioned_cache.modules().mark_estimate(&k, idx_to_validate);
-                    } else {
-                        versioned_cache.data().mark_estimate(&k, idx_to_validate);
-                    }
+                for (k, kind) in keys {
+                    use KeyKind::*;
+                    match kind {
+                        Resource => versioned_cache.data().mark_estimate(&k, idx_to_validate),
+                        Module => versioned_cache.modules().mark_estimate(&k, idx_to_validate),
+                        Group => {
+                            versioned_cache.data().mark_estimate(&k, idx_to_validate);
+                            versioned_cache
+                                .group_data()
+                                .mark_estimate(&k, idx_to_validate);
+                        },
+                    };
                 }
             }
 
@@ -228,6 +248,7 @@ where
         maybe_block_gas_limit: Option<u64>,
         scheduler: &Scheduler,
         scheduler_task: &mut SchedulerTask,
+        versioned_cache: &MVHashMap<T::Key, T::Tag, T::Value, X>,
         last_input_output: &TxnLastInputOutput<T, E::Output, E::Error>,
         shared_commit_state: &ExplicitSyncWrapper<(
             FeeStatement,
@@ -272,7 +293,41 @@ where
                 }
             }
 
-            if let Some(err) = last_input_output.execution_error(txn_idx) {
+            let group_metadata_ops = last_input_output.group_metadata_ops(txn_idx);
+            let mut finalized_groups = Vec::with_capacity(group_metadata_ops.len());
+            let mut maybe_err = None;
+            for (group_key, metadata_op) in group_metadata_ops.into_iter() {
+                match versioned_cache
+                    .group_data()
+                    .commit_group(&group_key, txn_idx)
+                {
+                    Ok(finalized_group) => {
+                        // commit_group already applies the deletions.
+                        if finalized_group.is_empty() != metadata_op.is_deletion() {
+                            error!(
+                                "Group is empty = {} but op is deletion = {}",
+                                finalized_group.is_empty(),
+                                metadata_op.is_deletion()
+                            );
+                            maybe_err = Some(Error::ResourceGroupError);
+                        }
+                        finalized_groups.push((group_key, metadata_op, finalized_group));
+                    },
+                    Err(e) => {
+                        error!("Error committing resource group {:?}", e);
+                        maybe_err = Some(Error::ResourceGroupError);
+                    },
+                };
+
+                if maybe_err.is_some() {
+                    break;
+                }
+            }
+            last_input_output.record_finalized_groups(txn_idx, finalized_groups);
+
+            maybe_err = maybe_err.or_else(|| last_input_output.execution_error(txn_idx));
+
+            if let Some(err) = maybe_err {
                 if scheduler.halt() {
                     *maybe_error = Some(err);
                     info!(
@@ -366,7 +421,8 @@ where
             delta_writes.push((k, WriteOp::Modification(serialize(&committed_delta).into())));
         }
 
-        last_input_output.record_delta_writes(txn_idx, delta_writes);
+        // Handles materialized deltas as well as resource groups.
+        last_input_output.record_additional_writes(txn_idx, delta_writes);
 
         if let Some(txn_commit_listener) = &self.transaction_commit_hook {
             let txn_output = last_input_output.txn_output(txn_idx).unwrap();
@@ -435,6 +491,7 @@ where
                     self.maybe_block_gas_limit,
                     scheduler,
                     &mut scheduler_task,
+                    versioned_cache,
                     last_input_output,
                     shared_commit_state,
                 );
@@ -610,14 +667,34 @@ where
                     {
                         data_map.write(key, write_op);
                     }
+                    for (group_key, group_ops) in output.resource_group_inner_ops().into_iter() {
+                        for (value_tag, group_op) in group_ops.into_iter() {
+                            data_map.insert_group_op(&group_key, value_tag, group_op);
+                        }
+                    }
+
                     // Calculating the accumulated gas costs of the committed txns.
                     let fee_statement = output.fee_statement();
                     accumulated_fee_statement.add_fee_statement(&fee_statement);
                     counters::update_sequential_txn_gas_counters(&fee_statement);
 
+                    let mut finalized_groups = vec![];
+                    for (group_key, metadata_op) in
+                        output.resource_group_write_metadata().into_iter()
+                    {
+                        let finalized_group = data_map.group_to_commit(&group_key);
+                        assert_eq!(
+                            finalized_group.is_empty(),
+                            metadata_op.is_deletion(),
+                            "Group contents not consistent with op kind"
+                        );
+                        finalized_groups.push((group_key, metadata_op, finalized_group));
+                    }
+
                     // No delta writes are needed for sequential execution.
-                    output.incorporate_delta_writes(vec![]);
-                    //
+                    output.record_groups(finalized_groups);
+                    output.incorporate_additional_writes(vec![]);
+
                     if let Some(commit_hook) = &self.transaction_commit_hook {
                         commit_hook.on_transaction_committed(idx as TxnIndex, &output);
                     }
@@ -695,8 +772,11 @@ where
             )
         };
 
-        if matches!(ret, Err(Error::ModulePathReadWrite)) {
-            debug!("[Execution]: Module read & written, sequential fallback");
+        if matches!(
+            ret,
+            Err(Error::ModulePathReadWrite) | Err(Error::ResourceGroupError)
+        ) {
+            debug!("[Execution]: Sequential fallback due to {:?}", ret);
 
             // All logs from the parallel execution should be cleared and not reported.
             // Clear by re-initializing the speculative logs.

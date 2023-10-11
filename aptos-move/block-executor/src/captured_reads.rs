@@ -218,19 +218,26 @@ impl<T: Transaction> CapturedReads<T> {
         }
     }
 
-    #[allow(dead_code)]
     pub(crate) fn capture_group_size(
         &mut self,
-        _state_key: T::Key,
-        _group_size: u64,
+        group_key: T::Key,
+        group_size: u64,
     ) -> anyhow::Result<()> {
-        unimplemented!("Group size capturing not implemented");
+        let group = self.group_reads.entry(group_key).or_default();
+
+        if let Some(recorded_size) = group.speculative_size {
+            if recorded_size != group_size {
+                bail!("Inconsistent recorded group size");
+            }
+        }
+
+        group.speculative_size = Some(group_size);
+        Ok(())
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn group_size(&self, state_key: &T::Key) -> Option<u64> {
+    pub(crate) fn group_size(&self, group_key: &T::Key) -> Option<u64> {
         self.group_reads
-            .get(state_key)
+            .get(group_key)
             .and_then(|group| group.speculative_size)
     }
 
@@ -574,9 +581,10 @@ mod test {
     }
 
     fn raw_metadata(v: u64) -> StateValueMetadataKind {
-        Some(StateValueMetadata::new(v, &CurrentTimeMicroseconds {
-            microseconds: v,
-        }))
+        Some(StateValueMetadata::new(
+            v,
+            &CurrentTimeMicroseconds { microseconds: v },
+        ))
     }
 
     #[test]

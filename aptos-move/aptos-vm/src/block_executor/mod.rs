@@ -15,6 +15,7 @@ use aptos_block_executor::{
     txn_commit_hook::TransactionCommitHook,
 };
 use aptos_infallible::Mutex;
+use aptos_logger::error;
 use aptos_state_view::{StateView, StateViewId};
 use aptos_types::{
     contract_event::ContractEvent,
@@ -25,19 +26,27 @@ use aptos_types::{
         signature_verified_transaction::SignatureVerifiedTransaction, TransactionOutput,
         TransactionStatus,
     },
-    write_set::WriteOp,
+    vm_status::DiscardedVMStatus,
+    write_set::{TransactionWrite, WriteOp, WriteSet},
 };
 use aptos_vm_logging::{flush_speculative_logs, init_speculative_logs};
 use aptos_vm_types::output::VMOutput;
-use move_core_types::vm_status::VMStatus;
+use bytes::Bytes;
+use claims::assert_ok;
+use move_core_types::{language_storage::StructTag, vm_status::VMStatus};
 use once_cell::sync::OnceCell;
 use rayon::ThreadPool;
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::Arc,
+};
 
-// Wrapper to avoid orphan rule
+/// Output type wrapper used by block executor. VM output and finalized groups are stored
+/// first, then transformed into TransactionOutput type that is returned.
 #[derive(Debug)]
 pub struct AptosTransactionOutput {
     vm_output: Mutex<Option<VMOutput>>,
+    finalized_groups: Mutex<Option<Vec<(StateKey, WriteOp, Vec<(StructTag, Arc<WriteOp>)>)>>>,
     committed_output: OnceCell<TransactionOutput>,
 }
 
@@ -45,6 +54,7 @@ impl AptosTransactionOutput {
     pub(crate) fn new(output: VMOutput) -> Self {
         Self {
             vm_output: Mutex::new(Some(output)),
+            finalized_groups: Mutex::new(None),
             committed_output: OnceCell::new(),
         }
     }
@@ -61,7 +71,7 @@ impl AptosTransactionOutput {
                 .lock()
                 .take()
                 .expect("Output must be set")
-                .into_transaction_output_with_materialized_deltas(vec![]),
+                .into_transaction_output_with_additional_writes(vec![], vec![]),
         }
     }
 }
@@ -69,14 +79,43 @@ impl AptosTransactionOutput {
 impl BlockExecutorTransactionOutput for AptosTransactionOutput {
     type Txn = SignatureVerifiedTransaction;
 
-    /// Execution output for transactions that comes after SkipRest signal.
+    /// Execution output for transactions that comes after SkipRest signal or when there was a
+    /// problem creating the outoput (e.g. group serialization issue).
     fn skip_output() -> Self {
         Self::new(VMOutput::empty_with_status(TransactionStatus::Retry))
     }
 
     // TODO: get rid of the cloning data-structures in the following APIs.
 
-    /// Should never be called after incorporate_delta_writes, as it
+    /// Should never be called after incorporate_additional_writes, as it
+    /// will consume vm_output to prepare an output with deltas.
+    fn resource_group_write_metadata(&self) -> Vec<(StateKey, WriteOp)> {
+        self.vm_output
+            .lock()
+            .as_ref()
+            .expect("Output to be set to get writes")
+            .change_set()
+            .resource_group_write_set()
+            .iter()
+            .map(|(group_key, group_write)| (group_key.clone(), group_write.metadata_op().clone()))
+            .collect()
+    }
+
+    /// Should never be called after incorporate_additional_writes, as it
+    /// will consume vm_output to prepare an output with deltas.
+    fn resource_group_inner_ops(&self) -> Vec<(StateKey, HashMap<StructTag, WriteOp>)> {
+        self.vm_output
+            .lock()
+            .as_ref()
+            .expect("Output to be set to get writes")
+            .change_set()
+            .resource_group_write_set()
+            .iter()
+            .map(|(group_key, group_write)| (group_key.clone(), group_write.inner_ops().clone()))
+            .collect()
+    }
+
+    /// Should never be called after incorporate_additional_writes, as it
     /// will consume vm_output to prepare an output with deltas.
     fn resource_write_set(&self) -> HashMap<StateKey, WriteOp> {
         self.vm_output
@@ -88,7 +127,7 @@ impl BlockExecutorTransactionOutput for AptosTransactionOutput {
             .clone()
     }
 
-    /// Should never be called after incorporate_delta_writes, as it
+    /// Should never be called after incorporate_additional_writes, as it
     /// will consume vm_output to prepare an output with deltas.
     fn module_write_set(&self) -> HashMap<StateKey, WriteOp> {
         self.vm_output
@@ -100,7 +139,7 @@ impl BlockExecutorTransactionOutput for AptosTransactionOutput {
             .clone()
     }
 
-    /// Should never be called after incorporate_delta_writes, as it
+    /// Should never be called after incorporate_additional_writes, as it
     /// will consume vm_output to prepare an output with deltas.
     fn aggregator_v1_write_set(&self) -> HashMap<StateKey, WriteOp> {
         self.vm_output
@@ -112,7 +151,7 @@ impl BlockExecutorTransactionOutput for AptosTransactionOutput {
             .clone()
     }
 
-    /// Should never be called after incorporate_delta_writes, as it
+    /// Should never be called after incorporate_additional_writes, as it
     /// will consume vm_output to prepare an output with deltas.
     fn aggregator_v1_delta_set(&self) -> HashMap<StateKey, DeltaOp> {
         self.vm_output
@@ -124,7 +163,7 @@ impl BlockExecutorTransactionOutput for AptosTransactionOutput {
             .clone()
     }
 
-    /// Should never be called after incorporate_delta_writes, as it
+    /// Should never be called after incorporate_additional_writes, as it
     /// will consume vm_output to prepare an output with deltas.
     fn get_events(&self) -> Vec<ContractEvent> {
         self.vm_output
@@ -136,20 +175,60 @@ impl BlockExecutorTransactionOutput for AptosTransactionOutput {
             .to_vec()
     }
 
-    /// Can be called (at most) once after transaction is committed to internally
-    /// include the delta outputs with the transaction outputs.
-    fn incorporate_delta_writes(&self, delta_writes: Vec<(StateKey, WriteOp)>) {
-        assert!(
-            self.committed_output
-                .set(
-                    self.vm_output
-                        .lock()
-                        .take()
-                        .expect("Output must be set to combine with deltas")
-                        .into_transaction_output_with_materialized_deltas(delta_writes),
-                )
-                .is_ok(),
-            "Could not combine VMOutput with deltas"
+    /// Record the finalized updates for resource groups, which is later to be serialized and
+    /// combined into final transaction output, by incorporate_additional_writes call, which
+    /// (unlike recording groups) is concurrent.
+    fn record_groups(&self, groups: Vec<(StateKey, WriteOp, Vec<(StructTag, Arc<WriteOp>)>)>) {
+        *self.finalized_groups.lock() = Some(groups);
+    }
+
+    /// Can be called (at most) once after transaction is committed to internally include
+    /// the resource group updates & delta outputs with the transaction outputs.
+    fn incorporate_additional_writes(&self, delta_writes: Vec<(StateKey, WriteOp)>) {
+        let groups = self
+            .finalized_groups
+            .lock()
+            .take()
+            .expect("Resource group output must be recorded");
+        let maybe_group_writes: Option<Vec<(StateKey, WriteOp)>> = groups
+            .into_iter()
+            .map(|(group_key, mut metadata_op, finalized_group)| {
+                let btree: BTreeMap<StructTag, Bytes> = finalized_group
+                    .into_iter()
+                    .filter_map(|(resource_tag, arc_v)| {
+                        arc_v.extract_raw_bytes().map(|bytes| (resource_tag, bytes))
+                    })
+                    .collect();
+
+                bcs::to_bytes(&btree).ok().map(|group_bytes| {
+                    metadata_op.set_bytes(group_bytes.into());
+                    (group_key, metadata_op)
+                })
+            })
+            .collect();
+
+        let output = if let Some(group_writes) = maybe_group_writes {
+            self.vm_output
+                .lock()
+                .take()
+                .expect("Output must be set to combine with deltas")
+                .into_transaction_output_with_additional_writes(delta_writes, group_writes)
+        } else {
+            error!("Resource group serialization error");
+            // Skip the transaction.
+            TransactionOutput::new(
+                WriteSet::default(),
+                vec![],
+                0,
+                TransactionStatus::Discard(
+                    DiscardedVMStatus::FAILED_TO_SERIALIZE_WRITE_SET_CHANGES,
+                ),
+            )
+        };
+
+        assert_ok!(
+            self.committed_output.set(output),
+            "Must commit output only once"
         );
     }
 
@@ -220,7 +299,7 @@ impl BlockAptosVM {
 
                 Ok(output_vec)
             },
-            Err(Error::ModulePathReadWrite) => {
+            Err(Error::ModulePathReadWrite) | Err(Error::ResourceGroupError) => {
                 unreachable!("[Execution]: Must be handled by sequential fallback")
             },
             Err(Error::UserError(err)) => Err(err),

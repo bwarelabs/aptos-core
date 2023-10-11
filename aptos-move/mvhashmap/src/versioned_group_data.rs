@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::types::{Flag, Incarnation, MVGroupError, ShiftedTxnIndex, TxnIndex, Version};
+use anyhow::bail;
 use aptos_types::write_set::TransactionWrite;
 use claims::assert_some;
 use crossbeam::utils::CachePadded;
@@ -102,7 +103,8 @@ impl<T: Hash + Clone + Debug + Eq + Serialize, V: TransactionWrite> VersionedGro
         self.idx_to_update
             .insert(shifted_idx, CachePadded::new(arc_map));
         if base_idx {
-            self.commit_idx(zero);
+            self.commit_idx(zero)
+                .expect("Marking storage version as committed must succeed");
         }
     }
 
@@ -146,21 +148,41 @@ impl<T: Hash + Clone + Debug + Eq + Serialize, V: TransactionWrite> VersionedGro
         }
     }
 
-    // Records and returns pointers for the latest committed value for each tag in the group.
-    fn commit_idx(&mut self, shifted_idx: ShiftedTxnIndex) -> HashMap<T, Arc<V>> {
+    // Records the latest committed op for each tag in the group (deleted tags ar excluded).
+    fn commit_idx(&mut self, shifted_idx: ShiftedTxnIndex) -> anyhow::Result<()> {
         let idx_updates = self
             .idx_to_update
             .get(&shifted_idx)
             .expect("Group updates must exist at the index to commit");
         for (tag, v) in idx_updates.iter() {
+            // TODO: do with entry.
+            if v.is_creation() != prev_value.is_none() {
+                bail!(
+                    "Write op kind {:?} not consistent w. prev value exists = {}",
+                    v.write_op_kind(),
+                    prev_value.is_some()
+                );
+            }
+
+            // TODO: assert invariants smarter (also modification).
             if v.is_deletion() {
-                self.committed_group.remove(tag);
+                if self.committed_group.remove(tag).is_none() {
+                    bail!("Removing non-existent resource from group");
+                }
             } else {
-                self.committed_group.insert(tag.clone(), v.clone());
+                let prev_value = self.committed_group.insert(tag.clone(), v.clone());
+
+                if v.is_creation() && prev_value.is_some() {
+                    bail!("Creating an already existing resource in group")
+                }
             }
         }
 
-        self.committed_group.clone()
+        Ok(())
+    }
+
+    fn get_committed_group(&self) -> Vec<(T, Arc<V>)> {
+        self.committed_group.clone().into_iter().collect()
     }
 
     fn get_latest_tagged_value(
@@ -321,10 +343,15 @@ impl<
     /// The method must be called when all transactions <= txn_idx are actually committed, and
     /// the values pointed by weak are guaranteed to be fixed and available during the lifetime
     /// of the data-structure itself.
-    pub fn commit_group(&self, key: &K, txn_idx: TxnIndex) -> HashMap<T, Arc<V>> {
+    ///
+    /// The method checks that each committed write op kind is consistent with the existence of
+    /// a previous value of the resource (must be creation iff no previous value, deletion or
+    /// modification otherwise). When consistent, the output is Ok(..).
+    pub fn commit_group(&self, key: &K, txn_idx: TxnIndex) -> anyhow::Result<Vec<(T, Arc<V>)>> {
         let mut v = self.group_values.get_mut(key).expect("Path must exist");
 
-        v.commit_idx(ShiftedTxnIndex::new(txn_idx))
+        v.commit_idx(ShiftedTxnIndex::new(txn_idx))?;
+        Ok(v.get_committed_group())
     }
 }
 

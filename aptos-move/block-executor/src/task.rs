@@ -10,7 +10,7 @@ use aptos_types::{
 };
 use aptos_vm_types::resolver::{TExecutorView, TResourceGroupView};
 use move_core_types::value::MoveTypeLayout;
-use std::{collections::HashMap, fmt::Debug};
+use std::{collections::HashMap, fmt::Debug, sync::Arc};
 
 /// The execution result of a transaction
 #[derive(Debug)]
@@ -94,13 +94,40 @@ pub trait TransactionOutput: Send + Sync + Debug {
     /// Get the events of a transaction from its output.
     fn get_events(&self) -> Vec<<Self::Txn as Transaction>::Event>;
 
+    /// Get resource group updates.
+    fn record_groups(
+        &self,
+        groups: Vec<(
+            <Self::Txn as Transaction>::Key,
+            <Self::Txn as Transaction>::Value,
+            Vec<(
+                <Self::Txn as Transaction>::Tag,
+                Arc<<Self::Txn as Transaction>::Value>,
+            )>,
+        )>,
+    );
+
+    fn resource_group_write_metadata(
+        &self,
+    ) -> Vec<(
+        <Self::Txn as Transaction>::Key,
+        <Self::Txn as Transaction>::Value,
+    )>;
+
+    fn resource_group_inner_ops(
+        &self,
+    ) -> Vec<(
+        <Self::Txn as Transaction>::Key,
+        HashMap<<Self::Txn as Transaction>::Tag, <Self::Txn as Transaction>::Value>,
+    )>;
+
     /// Execution output for transactions that comes after SkipRest signal.
     fn skip_output() -> Self;
 
-    /// In parallel execution, will be called once per transaction when the output is
-    /// ready to be committed. In sequential execution, won't be called (deltas are
-    /// materialized and incorporated during execution).
-    fn incorporate_delta_writes(
+    /// Will be called once per transaction when the output is ready to be committed.
+    /// Ensures that any writes corresponding to materialized deltas and group updates
+    /// (recorded in output separately) are incorporated into the transaction output.
+    fn incorporate_additional_writes(
         &self,
         delta_writes: Vec<(<Self::Txn as Transaction>::Key, WriteOp)>,
     );
