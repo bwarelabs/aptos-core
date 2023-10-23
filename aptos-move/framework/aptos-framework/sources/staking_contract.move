@@ -62,7 +62,7 @@ module aptos_framework::staking_contract {
     /// Maximum number of distributions a stake pool can support.
     const MAXIMUM_PENDING_DISTRIBUTIONS: u64 = 20;
 
-    #[resource_group(scope=module_)]
+    #[resource_group(scope = module_)]
     struct StakingGroupContainer {}
 
     struct StakingContract has store {
@@ -374,7 +374,11 @@ module aptos_framework::staking_contract {
 
     /// Convenience function to allow a staker to update the commission percentage paid to the operator.
     /// TODO: fix the typo in function name. commision -> commission
-    public entry fun update_commision(staker: &signer, operator: address, new_commission_percentage: u64) acquires Store, StakingGroupUpdateCommissionEvent {
+    public entry fun update_commision(
+        staker: &signer,
+        operator: address,
+        new_commission_percentage: u64
+    ) acquires Store, StakingGroupUpdateCommissionEvent {
         assert!(
             new_commission_percentage >= 0 && new_commission_percentage <= 100,
             error::invalid_argument(EINVALID_COMMISSION_PERCENTAGE),
@@ -395,7 +399,14 @@ module aptos_framework::staking_contract {
         let old_commission_percentage = staking_contract.commission_percentage;
         staking_contract.commission_percentage = new_commission_percentage;
         if (!exists<StakingGroupUpdateCommissionEvent>(staker_address)) {
-            move_to(staker, StakingGroupUpdateCommissionEvent { update_commission_events: account::new_event_handle<UpdateCommissionEvent>(staker)})
+            move_to(
+                staker,
+                StakingGroupUpdateCommissionEvent {
+                    update_commission_events: account::new_event_handle<UpdateCommissionEvent>(
+                        staker
+                    )
+                }
+            )
         };
         emit_event(
             &mut borrow_global_mut<StakingGroupUpdateCommissionEvent>(staker_address).update_commission_events,
@@ -778,7 +789,16 @@ module aptos_framework::staking_contract {
     #[test_only]
     public fun setup(aptos_framework: &signer, staker: &signer, operator: &signer, initial_balance: u64) {
         // Reward rate of 0.1% per epoch.
-        stake::initialize_for_test_custom(aptos_framework, INITIAL_BALANCE, MAXIMUM_STAKE, 3600, true, 10, 10000, 1000000);
+        stake::initialize_for_test_custom(
+            aptos_framework,
+            INITIAL_BALANCE,
+            MAXIMUM_STAKE,
+            3600,
+            true,
+            10,
+            10000,
+            1000000
+        );
 
         let staker_address = signer::address_of(staker);
         if (!account::exists_at(staker_address)) {
@@ -1256,8 +1276,13 @@ module aptos_framework::staking_contract {
         assert_distribution(staker_address, operator_address, staker_address, withdrawn_stake);
         assert!(last_recorded_principal(staker_address, operator_address) == new_balance, 0);
     }
+
     #[test(aptos_framework = @0x1, staker = @0x123, operator = @0x234)]
-    public entry fun test_update_commission(aptos_framework: &signer, staker: &signer, operator: &signer) acquires Store, StakingGroupUpdateCommissionEvent {
+    public entry fun test_update_commission(
+        aptos_framework: &signer,
+        staker: &signer,
+        operator: &signer
+    ) acquires Store, StakingGroupUpdateCommissionEvent {
         let initial_balance = INITIAL_BALANCE * 2;
         setup_staking_contract(aptos_framework, staker, operator, initial_balance, 10);
         let staker_address = signer::address_of(staker);
@@ -1281,7 +1306,10 @@ module aptos_framework::staking_contract {
         stake::assert_stake_pool(pool_address, balance_2epoch, 0, 0, with_rewards(unpaid_commission));
     }
 
-    #[test(staker = @0xe256f4f4e2986cada739e339895cf5585082ff247464cab8ec56eea726bd2263, operator= @0x9f0a211d218b082987408f1e393afe1ba0c202c6d280f081399788d3360c7f09)]
+    #[test(
+        staker = @0xe256f4f4e2986cada739e339895cf5585082ff247464cab8ec56eea726bd2263,
+        operator = @0x9f0a211d218b082987408f1e393afe1ba0c202c6d280f081399788d3360c7f09
+    )]
     public entry fun test_get_expected_stake_pool_address(staker: address, operator: address) {
         let pool_address = get_expected_stake_pool_address(staker, operator, vector[0x42, 0x42]);
         assert!(pool_address == @0x9d9648031ada367c26f7878eb0b0406ae6a969b1a43090269e5cdfabe1b48f0f, 0);
@@ -1292,7 +1320,10 @@ module aptos_framework::staking_contract {
         staker: address, operator: address, principal: u64, commission_percentage: u64) acquires Store {
         let staking_contract = simple_map::borrow(&borrow_global<Store>(staker).staking_contracts, &operator);
         assert!(staking_contract.principal == principal, staking_contract.principal);
-        assert!(staking_contract.commission_percentage == commission_percentage, staking_contract.commission_percentage);
+        assert!(
+            staking_contract.commission_percentage == commission_percentage,
+            staking_contract.commission_percentage
+        );
     }
 
     #[test_only]
