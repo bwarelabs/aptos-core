@@ -594,11 +594,20 @@ module aptos_framework::staking_contract {
         operator: address,
     ): (u64, address, OwnerCapability, u64, Pool, SignerCapability) acquires Store {
         let staker_address = signer::address_of(staker);
-        // withdraw entire inactive stake and unlock commission produced so far
-        request_commission(staker, staker_address, operator);
+        assert_staking_contract_exists(staker_address, operator);
 
         let store = borrow_global_mut<Store>(staker_address);
         let (_, staking_contract) = simple_map::remove(&mut store.staking_contracts, &operator);
+
+        // withdraw entire inactive stake and unlock commission produced so far
+        distribute_internal(staker_address, operator, &mut staking_contract, &mut store.distribute_events);
+        request_commission_internal(
+            operator,
+            &mut staking_contract,
+            &mut store.add_distribution_events,
+            &mut store.request_commission_events,
+        );
+
         let StakingContract {
             principal,
             pool_address,
