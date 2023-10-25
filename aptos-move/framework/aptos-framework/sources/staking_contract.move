@@ -40,6 +40,8 @@ module aptos_framework::staking_contract {
     use aptos_framework::stake::{Self, OwnerCapability};
     use aptos_framework::staking_config;
 
+    friend aptos_framework::delegation_pool;
+
     const SALT: vector<u8> = b"aptos_framework::staking_contract";
 
     /// Store amount must be at least the min stake required for a stake pool to join the validator set.
@@ -585,6 +587,28 @@ module aptos_framework::staking_contract {
             &mut store.switch_operator_events,
             SwitchOperatorEvent { pool_address, old_operator, new_operator }
         );
+    }
+
+    public(friend) fun destroy_staking_contract(
+        staker: &signer,
+        operator: address,
+    ): (u64, address, OwnerCapability, u64, Pool, SignerCapability) acquires Store {
+        let staker_address = signer::address_of(staker);
+        // withdraw entire inactive stake and unlock commission produced so far
+        request_commission(staker, staker_address, operator);
+
+        let store = borrow_global_mut<Store>(staker_address);
+        let (_, staking_contract) = simple_map::remove(&mut store.staking_contracts, &operator);
+        let StakingContract {
+            principal,
+            pool_address,
+            owner_cap,
+            commission_percentage,
+            distribution_pool,
+            signer_cap,
+        } = staking_contract;
+
+        (principal, pool_address, owner_cap, commission_percentage, distribution_pool, signer_cap)
     }
 
     /// Allow anyone to distribute already unlocked funds. This does not affect reward compounding and therefore does

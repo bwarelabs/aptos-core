@@ -114,6 +114,7 @@ module aptos_framework::delegation_pool {
     use std::vector;
 
     use aptos_std::math64;
+    use aptos_std::pool_u64::{Self as pool_u64_enumerable};
     use aptos_std::pool_u64_unbound::{Self as pool_u64, total_coins};
     use aptos_std::table::{Self, Table};
     use aptos_std::smart_table::{Self, SmartTable};
@@ -125,6 +126,7 @@ module aptos_framework::delegation_pool {
     use aptos_framework::event::{Self, EventHandle};
     use aptos_framework::stake;
     use aptos_framework::staking_config;
+    use aptos_framework::staking_contract;
     use aptos_framework::timestamp;
 
     const MODULE_SALT: vector<u8> = b"aptos_framework::delegation_pool";
@@ -182,6 +184,12 @@ module aptos_framework::delegation_pool {
 
     /// The stake pool has already voted on the proposal before enabling partial governance voting on this delegation pool.
     const EALREADY_VOTED_BEFORE_ENABLE_PARTIAL_VOTING: u64 = 17;
+
+    /// The underlying stake pool of the staking contract is not stored on its resource account.
+    const ESTAKE_POOL_NOT_ON_STAKING_CONTRACT_RESOURCE_ACCOUNT: u64 = 18;
+
+    /// The staking contract cannot be converted to a delegation pool while having pending_active stake (for simplicity).
+    const EPENDING_ACTIVE_STAKE_ON_STAKING_CONTRACT: u64 = 19;
 
     const MAX_U64: u64 = 18446744073709551615;
 
@@ -639,6 +647,94 @@ module aptos_framework::delegation_pool {
         move_to(owner, DelegationPoolOwnership { pool_address });
 
         // All delegation pool enable partial governace voting by default once the feature flag is enabled.
+        if (features::partial_governance_voting_enabled(
+        ) && features::delegation_pool_partial_governance_voting_enabled()) {
+            enable_partial_governance_voting(pool_address);
+        }
+    }
+
+    public entry fun initialize_delegation_pool_from_staking_contract(
+        staker: &signer,
+        operator: address,
+    ) acquires DelegationPool, GovernanceRecords {
+        assert!(features::delegation_pools_enabled(), error::invalid_state(EDELEGATION_POOLS_DISABLED));
+
+        // destroy staking contract and take ownership of the underlying stake pool
+        let (principal, pool_address, owner_cap, operator_commission_percentage, distribution_pool, stake_pool_signer_cap) = staking_contract::destroy_staking_contract(
+            staker,
+            operator
+        );
+
+        assert!(
+            pool_address == account::get_signer_capability_address(&stake_pool_signer_cap),
+            error::internal(ESTAKE_POOL_NOT_ON_STAKING_CONTRACT_RESOURCE_ACCOUNT)
+        );
+
+        // ensure there is no pending_active stake so there is no need to extract the `add_stake` fee for staker
+        let (_, _, pending_active, _) = stake::get_stake(pool_address);
+        assert!(pending_active == 0, error::invalid_state(EPENDING_ACTIVE_STAKE_ON_STAKING_CONTRACT));
+
+        // convert legacy commission to a 2-decimals precision percentage
+        operator_commission_percentage = operator_commission_percentage * 100;
+        assert!(operator_commission_percentage <= MAX_FEE, error::invalid_argument(EINVALID_COMMISSION_PERCENTAGE));
+
+        let stake_pool_signer = account::create_signer_with_capability(&stake_pool_signer_cap);
+        // stake_pool_signer will be owner of the stake pool and have its `stake::OwnerCapability`
+        stake::deposit_owner_cap(&stake_pool_signer, owner_cap);
+
+        let inactive_shares = table::new<ObservedLockupCycle, pool_u64::Pool>();
+        table::add(
+            &mut inactive_shares,
+            olc_with_index(0),
+            pool_u64::create_with_scaling_factor(SHARES_SCALING_FACTOR)
+        );
+
+        let pool = DelegationPool {
+            active_shares: pool_u64::create_with_scaling_factor(SHARES_SCALING_FACTOR),
+            observed_lockup_cycle: olc_with_index(0),
+            inactive_shares,
+            pending_withdrawals: table::new<address, ObservedLockupCycle>(),
+            stake_pool_signer_cap,
+            total_coins_inactive: 0,
+            operator_commission_percentage,
+            add_stake_events: account::new_event_handle<AddStakeEvent>(&stake_pool_signer),
+            reactivate_stake_events: account::new_event_handle<ReactivateStakeEvent>(&stake_pool_signer),
+            unlock_stake_events: account::new_event_handle<UnlockStakeEvent>(&stake_pool_signer),
+            withdraw_stake_events: account::new_event_handle<WithdrawStakeEvent>(&stake_pool_signer),
+            distribute_commission_events: account::new_event_handle<DistributeCommissionEvent>(&stake_pool_signer),
+        };
+
+        // assign active shares to staking_contract's staker
+        let staker_address = signer::address_of(staker);
+        buy_in_active_shares(&mut pool, staker_address, principal);
+        assert_min_active_balance(&pool, staker_address); //?
+
+        // assign any pending_inactive shares to staking contract's staker, current operator, previous operators
+        while (pool_u64_enumerable::shareholders_count(&distribution_pool) > 0) {
+            let recipients = pool_u64_enumerable::shareholders(&distribution_pool);
+            let recipient = *vector::borrow(&mut recipients, 0);
+            let current_shares = pool_u64_enumerable::shares(&distribution_pool, recipient);
+            let amount_to_distribute = pool_u64_enumerable::redeem_shares(
+                &mut distribution_pool,
+                recipient,
+                current_shares
+            );
+
+            buy_in_pending_inactive_shares(&mut pool, recipient, amount_to_distribute);
+            assert_min_pending_inactive_balance(&pool, recipient); //?
+        };
+
+        // destroy the distribution pool which has 0 total shares now
+        pool_u64_enumerable::update_total_coins(&mut distribution_pool, 0);
+        pool_u64_enumerable::destroy_empty(distribution_pool);
+
+        // store `DelegationPool` on the resource account also storing the `StakePool` of closed staking contract
+        move_to(&stake_pool_signer, pool);
+
+        // save delegation pool ownership and resource account address (inner stake pool address) on `staker`
+        move_to(staker, DelegationPoolOwnership { pool_address });
+
+        // All delegation pools enable partial governace voting by default once the feature flag is enabled.
         if (features::partial_governance_voting_enabled(
         ) && features::delegation_pool_partial_governance_voting_enabled()) {
             enable_partial_governance_voting(pool_address);
