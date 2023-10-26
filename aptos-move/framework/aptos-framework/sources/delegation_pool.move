@@ -660,17 +660,21 @@ module aptos_framework::delegation_pool {
         assert!(features::delegation_pools_enabled(), error::invalid_state(EDELEGATION_POOLS_DISABLED));
 
         // destroy staking contract and take ownership of the underlying stake pool
-        let (principal, pool_address, owner_cap, operator_commission_percentage, distribution_pool, stake_pool_signer_cap) = staking_contract::destroy_staking_contract(
-            staker,
-            operator
-        );
+        let (
+            principal,
+            pool_address,
+            owner_cap,
+            operator_commission_percentage,
+            distribution_pool,
+            stake_pool_signer_cap
+        ) = staking_contract::destroy_staking_contract(staker, operator);
 
         assert!(
             pool_address == account::get_signer_capability_address(&stake_pool_signer_cap),
             error::internal(ESTAKE_POOL_NOT_ON_STAKING_CONTRACT_RESOURCE_ACCOUNT)
         );
 
-        // ensure there is no pending_active stake so there is no need to extract the `add_stake` fee for staker
+        // ensure there is no pending_active stake so it's not needed to extract the `add_stake` fee from staker
         let (_, _, pending_active, _) = stake::get_stake(pool_address);
         assert!(pending_active == 0, error::invalid_state(EPENDING_ACTIVE_STAKE_ON_STAKING_CONTRACT));
 
@@ -695,6 +699,7 @@ module aptos_framework::delegation_pool {
             inactive_shares,
             pending_withdrawals: table::new<address, ObservedLockupCycle>(),
             stake_pool_signer_cap,
+            // already called staking_contract::distribute_internal which withdrawn all inactive stake
             total_coins_inactive: 0,
             operator_commission_percentage,
             add_stake_events: account::new_event_handle<AddStakeEvent>(&stake_pool_signer),
@@ -707,7 +712,7 @@ module aptos_framework::delegation_pool {
         // assign active shares to staking_contract's staker
         let staker_address = signer::address_of(staker);
         buy_in_active_shares(&mut pool, staker_address, principal);
-        assert_min_active_balance(&pool, staker_address); //?
+        // no need to assert on the minimum required stake as any next operation of this delegator will enforce it
 
         // assign any pending_inactive shares to staking contract's staker, current operator, previous operators
         while (pool_u64_enumerable::shareholders_count(&distribution_pool) > 0) {
@@ -721,14 +726,14 @@ module aptos_framework::delegation_pool {
             );
 
             buy_in_pending_inactive_shares(&mut pool, recipient, amount_to_distribute);
-            assert_min_pending_inactive_balance(&pool, recipient); //?
+            // no need to assert on the minimum required stake as any next operation of this delegator will enforce it
         };
 
-        // destroy the distribution pool which has 0 total shares now
+        // destroy distribution pool of 0 total shares now, any dust will be captured as pending_inactive rewards
         pool_u64_enumerable::update_total_coins(&mut distribution_pool, 0);
         pool_u64_enumerable::destroy_empty(distribution_pool);
 
-        // store `DelegationPool` on the resource account also storing the `StakePool` of closed staking contract
+        // store `DelegationPool` on the resource account also storing the `StakePool` of the destroyed staking contract
         move_to(&stake_pool_signer, pool);
 
         // save delegation pool ownership and resource account address (inner stake pool address) on `staker`
