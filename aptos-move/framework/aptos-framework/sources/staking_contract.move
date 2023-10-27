@@ -1031,6 +1031,27 @@ module aptos_framework::staking_contract {
     }
 
     #[test(aptos_framework = @0x1, staker = @0x123, operator = @0x234)]
+    #[expected_failure(abort_code = 0x60004, location = Self)]
+    public entry fun test_staker_cannot_destroy_staking_contract_again(
+        aptos_framework: &signer,
+        staker: &signer,
+        operator: &signer,
+    ) acquires Store {
+        setup_staking_contract(aptos_framework, staker, operator, INITIAL_BALANCE, 10);
+        let operator_address = signer::address_of(operator);
+
+        let (_, _, owner_cap, _, distribution_pool, _) = destroy_staking_contract(staker, operator_address);
+        stake::deposit_owner_cap(staker, owner_cap);
+        pool_u64::update_total_coins(&mut distribution_pool, 0);
+        pool_u64::destroy_empty(distribution_pool);
+
+        let (_, _, owner_cap, _, distribution_pool, _) = destroy_staking_contract(staker, operator_address);
+        stake::deposit_owner_cap(staker, owner_cap);
+        pool_u64::update_total_coins(&mut distribution_pool, 0);
+        pool_u64::destroy_empty(distribution_pool);
+    }
+
+    #[test(aptos_framework = @0x1, staker = @0x123, operator = @0x234)]
     #[expected_failure(abort_code = 0x10002, location = Self)]
     public entry fun test_staker_cannot_create_staking_contract_with_invalid_commission(
         aptos_framework: &signer,
