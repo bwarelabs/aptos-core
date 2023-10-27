@@ -1201,6 +1201,97 @@ module aptos_framework::staking_contract {
         assert!(commission_percentage(staker_address, operator_2_address) == 10, 2);
     }
 
+    #[test(aptos_framework = @0x1, staker = @0x123, operator_1 = @0x234, operator_2 = @0x345)]
+    public entry fun test_destroy_staking_contract(
+        aptos_framework: &signer,
+        staker: &signer,
+        operator_1: &signer,
+        operator_2: &signer,
+    ) acquires Store {
+        setup_staking_contract(aptos_framework, staker, operator_1, INITIAL_BALANCE, 10);
+        let staker_address = signer::address_of(staker);
+        let operator_1_address = signer::address_of(operator_1);
+        let operator_2_address = signer::address_of(operator_2);
+        let pool_address = stake_pool_address(staker_address, operator_1_address);
+
+        // Create operator 2 account.
+        if (!account::exists_at(operator_2_address)) {
+            account::create_account_for_test(operator_2_address);
+            coin::register<AptosCoin>(operator_2);
+        };
+
+        // Operator joins the validator set so rewards are generated.
+        let (_sk, pk, pop) = stake::generate_identity();
+        stake::join_validator_set_for_test(&pk, &pop, operator_1, pool_address, true);
+        assert!(stake::get_validator_state(pool_address) == VALIDATOR_STATUS_ACTIVE, 1);
+
+        // Fast forward to generate rewards.
+        stake::end_epoch();
+
+        // Request commission for operator 1.
+        request_commission(operator_1, staker_address, operator_1_address);
+
+        // Switch operators.
+        switch_operator_with_same_commission(staker, operator_1_address, operator_2_address);
+        assert!(!staking_contract_exists(staker_address, operator_1_address), 1);
+
+        // Fast forward to generate rewards.
+        stake::end_epoch();
+
+        // Request commission for operator 2.
+        request_commission(operator_2, staker_address, operator_2_address);
+
+        // Unlock some stake of staker.
+        unlock_stake(staker, operator_2_address, 10000);
+
+        // Unlock pending distributions.
+        stake::fast_forward_to_unlock(pool_address);
+        let (_, inactive, _, pending_inactive) = stake::get_stake(pool_address);
+        assert!(inactive > 0, 1);
+        assert!(pending_inactive == 0, 1);
+
+        // Fast forward to generate rewards.
+        stake::end_epoch();
+
+        // Destroy staking contract and expect full ownership and accountability of its stake.
+        let balance = coin::balance<AptosCoin>(staker_address) +
+            coin::balance<AptosCoin>(operator_1_address) +
+            coin::balance<AptosCoin>(operator_2_address);
+        let (
+            principal,
+            pool_address,
+            owner_cap,
+            _,
+            distribution_pool,
+            stake_pool_signer_cap
+        ) = destroy_staking_contract(staker, operator_2_address);
+
+        // Inactive distributions have been entirely withdrawn.
+        assert!(coin::balance<AptosCoin>(staker_address) +
+            coin::balance<AptosCoin>(operator_1_address) +
+            coin::balance<AptosCoin>(operator_2_address) == balance + inactive, 1);
+
+        // `StakingContract` resource doesn't exist anywhere.
+        assert!(!staking_contract_exists(staker_address, operator_1_address), 1);
+        assert!(!staking_contract_exists(staker_address, operator_2_address), 1);
+
+        // Remaining stake of the stake pool is accounted for.
+        let (active, inactive, pending_active, pending_inactive) = stake::get_stake(pool_address);
+        assert!(principal == active + pending_active, 1);
+        assert!(pending_inactive == pool_u64::total_coins(&distribution_pool), 1);
+        assert!(inactive == 0, 1);
+
+        // Resource account storing the stake pool is accessible
+        assert!(pool_address == account::get_signer_capability_address(&stake_pool_signer_cap), 1);
+        // Ownership capability over the stake pool is accessible
+        assert!(pool_address == stake::get_owned_pool_address(&owner_cap), 1);
+
+        // Handle objects without `drop` ability.
+        stake::deposit_owner_cap(staker, owner_cap);
+        pool_u64::update_total_coins(&mut distribution_pool, 0);
+        pool_u64::destroy_empty(distribution_pool);
+    }
+
     #[test(aptos_framework = @0x1, staker = @0x123, operator = @0x234)]
     public entry fun test_staker_can_withdraw_partial_stake(
         aptos_framework: &signer, staker: &signer, operator: &signer) acquires Store {
