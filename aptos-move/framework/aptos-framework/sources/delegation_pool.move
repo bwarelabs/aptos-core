@@ -658,7 +658,8 @@ module aptos_framework::delegation_pool {
         operator: address,
     ) acquires DelegationPool, GovernanceRecords {
         assert!(features::delegation_pools_enabled(), error::invalid_state(EDELEGATION_POOLS_DISABLED));
-        assert!(!owner_cap_exists(signer::address_of(staker)), error::already_exists(EOWNER_CAP_ALREADY_EXISTS));
+        let staker_address = signer::address_of(staker);
+        assert!(!owner_cap_exists(staker_address), error::already_exists(EOWNER_CAP_ALREADY_EXISTS));
 
         // destroy staking contract and take ownership of the underlying stake pool
         let (
@@ -712,8 +713,12 @@ module aptos_framework::delegation_pool {
             distribute_commission_events: account::new_event_handle<DistributeCommissionEvent>(&stake_pool_signer),
         };
 
+        // Grant ownership over the existing stake to participants of the former staking contract.
+        // 1. `synchronize_delegation_pool` MUST NOT be called during this process because stake would be distributed as
+        // rewards rather than being privately owned
+        // 2. partial governance voting is kept disabled for simplicity
+
         // assign active shares to staking_contract's staker
-        let staker_address = signer::address_of(staker);
         buy_in_active_shares(&mut pool, staker_address, principal);
         // no need to assert on the minimum required stake as any next operation of this delegator will enforce it
 
@@ -737,14 +742,17 @@ module aptos_framework::delegation_pool {
         pool_u64_enumerable::destroy_empty(distribution_pool);
 
         // store `DelegationPool` on the resource account also storing the `StakePool` of the destroyed staking contract
+        // `synchronize_delegation_pool` have not been called as it explicitly borrows the `DelegationPool` resource
+        // from store, but this resource is firstly moved to store here
         move_to(&stake_pool_signer, pool);
 
         // save delegation pool ownership and resource account address (inner stake pool address) on `staker`
         move_to(staker, DelegationPoolOwnership { pool_address });
 
-        // All delegation pools enable partial governace voting by default once the feature flag is enabled.
+        // All delegation pools enable partial governance voting by default once the feature flag is enabled.
         if (features::partial_governance_voting_enabled(
         ) && features::delegation_pool_partial_governance_voting_enabled()) {
+            // partial voting has been disabled as enabling it again here would fail
             enable_partial_governance_voting(pool_address);
         }
     }
@@ -2037,7 +2045,15 @@ module aptos_framework::delegation_pool {
         validator: &signer,
         operator: &signer,
     ) acquires DelegationPool, GovernanceRecords {
-        features::change_feature_flags(aptos_framework, vector[DELEGATION_POOLS], vector[]);
+        features::change_feature_flags(
+            aptos_framework,
+            vector[
+                features::get_delegation_pools_feature(),
+                features::get_partial_governance_voting(),
+                features::get_delegation_pool_partial_governance_voting(),
+            ],
+            vector[]
+        );
         staking_contract::setup_staking_contract(
             aptos_framework,
             validator,
@@ -2097,6 +2113,13 @@ module aptos_framework::delegation_pool {
             coin::balance<AptosCoin>(operator_address) == balance + 40060020000,
             coin::balance<AptosCoin>(operator_address)
         );
+        assert_delegation(
+            operator_address,
+            pool_address,
+            (((100200100000000 - 40020000000) / 1000) * 20) / 100 - 1,
+            0,
+            0
+        );
     }
 
     #[test(aptos_framework = @aptos_framework, validator = @0x123, operator = @0x456)]
@@ -2107,7 +2130,15 @@ module aptos_framework::delegation_pool {
         validator: &signer,
         operator: &signer,
     ) acquires DelegationPool, GovernanceRecords {
-        features::change_feature_flags(aptos_framework, vector[DELEGATION_POOLS], vector[]);
+        features::change_feature_flags(
+            aptos_framework,
+            vector[
+                features::get_delegation_pools_feature(),
+                features::get_partial_governance_voting(),
+                features::get_delegation_pool_partial_governance_voting(),
+            ],
+            vector[]
+        );
         staking_contract::setup_staking_contract(
             aptos_framework,
             validator,
@@ -2145,7 +2176,6 @@ module aptos_framework::delegation_pool {
 
         // Unlock pending distributions.
         stake::fast_forward_to_unlock(pool_address);
-
         let (total_active_stake, accumulated_rewards, commission_amount) =
             staking_contract::staking_contract_amounts(validator_address, operator_address);
         assert!(total_active_stake == 100180080000000, total_active_stake);
@@ -2180,7 +2210,15 @@ module aptos_framework::delegation_pool {
         operator1: &signer,
         operator2: &signer,
     ) acquires DelegationPool, GovernanceRecords {
-        features::change_feature_flags(aptos_framework, vector[DELEGATION_POOLS], vector[]);
+        features::change_feature_flags(
+            aptos_framework,
+            vector[
+                features::get_delegation_pools_feature(),
+                features::get_partial_governance_voting(),
+                features::get_delegation_pool_partial_governance_voting(),
+            ],
+            vector[]
+        );
         staking_contract::setup_staking_contract(
             aptos_framework,
             validator,
@@ -2262,7 +2300,15 @@ module aptos_framework::delegation_pool {
         validator: &signer,
         operator: &signer,
     ) acquires DelegationPool, GovernanceRecords {
-        features::change_feature_flags(aptos_framework, vector[DELEGATION_POOLS], vector[]);
+        features::change_feature_flags(
+            aptos_framework,
+            vector[
+                features::get_delegation_pools_feature(),
+                features::get_partial_governance_voting(),
+                features::get_delegation_pool_partial_governance_voting(),
+            ],
+            vector[]
+        );
         staking_contract::setup_staking_contract(
             aptos_framework,
             validator,
