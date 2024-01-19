@@ -83,6 +83,10 @@ module aptos_framework::staking_contract {
         signer_cap: SignerCapability,
     }
 
+    struct StakingContractActiveStake has store {
+        active_shares_pool: Pool,
+    }
+
     struct Store has key {
         staking_contracts: SimpleMap<address, StakingContract>,
 
@@ -96,6 +100,10 @@ module aptos_framework::staking_contract {
         switch_operator_events: EventHandle<SwitchOperatorEvent>,
         add_distribution_events: EventHandle<AddDistributionEvent>,
         distribute_events: EventHandle<DistributeEvent>,
+    }
+
+    struct StoreActiveStake has key {
+        staking_contracts_active_stake: SimpleMap<address, StakingContractActiveStake>,
     }
 
     struct BeneficiaryForOperator has key {
@@ -345,6 +353,40 @@ module aptos_framework::staking_contract {
             CreateStakingContractEvent { operator, voter, pool_address, principal, commission_percentage },
         );
         pool_address
+    }
+
+    public entry fun enable_partial_commission_withdrawals(
+        staker: &signer,
+        operator: address
+    ) acquires Store, BeneficiaryForOperator {
+        let staker_address = signer::address_of(staker);
+        assert_staking_contract_exists(staker_address, operator);
+
+        // Merging two existing staking contracts is too complex as we'd need to merge two separate stake pools.
+        let store = borrow_global_mut<Store>(staker_address);
+        let staking_contracts = &mut store.staking_contracts;
+
+        let (_, staking_contract) = simple_map::remove(staking_contracts, &operator);
+        // Force distribution of any already inactive stake.
+        distribute_internal(staker_address, operator, &mut staking_contract, &mut store.distribute_events);
+
+        // For simplicity, we request commission to be paid out first. This avoids having to ensure to staker doesn't
+        // withdraw into the commission portion.
+        request_commission_internal(
+            operator,
+            &mut staking_contract,
+            &mut store.add_distribution_events,
+            &mut store.request_commission_events,
+        );
+
+        if (!exists<StoreActiveStake>(staker_address)) {
+            move_to(
+                staker,
+                StoreActiveStake {
+                    staking_contracts_active_stake: simple_map::new<address, StakingContractActiveStake>()
+                }
+            );
+        };
     }
 
     /// Add more stake to an existing staking contract.
