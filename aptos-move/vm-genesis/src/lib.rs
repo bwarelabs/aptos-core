@@ -276,7 +276,12 @@ pub fn encode_genesis_change_set(
     initialize_randomness_config(&mut session, randomness_config);
     initialize_randomness_resources(&mut session);
     initialize_on_chain_governance(&mut session, genesis_config);
-    create_and_initialize_validators(&mut session, validators);
+    let validators_with_commission = validators.into_iter().map(|val| ValidatorWithCommissionRate{
+        validator: val.clone(),
+        validator_commission_percentage: 10,
+        join_during_genesis:true
+    }).collect::<Vec<ValidatorWithCommissionRate>>();
+    create_and_initialize_validators_with_commission(&mut session, validators_with_commission.as_slice());
     if genesis_config.is_test {
         allow_core_resources_to_set_version(&mut session);
     }
