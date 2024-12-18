@@ -320,13 +320,13 @@ module aptos_framework::genesis {
         vector::for_each_reverse(validators, |validator| {
             let validator_with_commission = ValidatorConfigurationWithCommission {
                 validator_config: validator,
-                commission_percentage: 0,
+                commission_percentage: 10,
                 join_during_genesis: true,
             };
             vector::push_back(&mut validators_with_commission, validator_with_commission);
         });
 
-        create_initialize_validators_with_commission(aptos_framework, false, validators_with_commission);
+        create_initialize_validators_with_commission(aptos_framework, true, validators_with_commission);
     }
 
     fun create_initialize_validator(
@@ -335,8 +335,10 @@ module aptos_framework::genesis {
         use_staking_contract: bool,
     ) {
         let validator = &commission_config.validator_config;
+        let balance_amount = 1_000_000_000_000_000;
+        let stake_amount = 100_000_000_000_000;
 
-        let owner = &create_account(aptos_framework, validator.owner_address, validator.stake_amount);
+        let owner = &create_account(aptos_framework, validator.owner_address, balance_amount);
         create_account(aptos_framework, validator.operator_address, 0);
         create_account(aptos_framework, validator.voter_address, 0);
 
@@ -346,7 +348,7 @@ module aptos_framework::genesis {
                 owner,
                 validator.operator_address,
                 validator.voter_address,
-                validator.stake_amount,
+                stake_amount,
                 commission_config.commission_percentage,
                 x"",
             );
@@ -354,7 +356,7 @@ module aptos_framework::genesis {
         } else {
             stake::initialize_stake_owner(
                 owner,
-                validator.stake_amount,
+                stake_amount,
                 validator.operator_address,
                 validator.voter_address,
             );
